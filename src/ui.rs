@@ -1,4 +1,5 @@
 use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -6,13 +7,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use gpui::{
     App, Application, Bounds, Context, CursorStyle, Div, FocusHandle, KeyDownEvent, Keystroke,
-    MouseButton, MouseMoveEvent, SharedString, Window, WindowBounds, WindowOptions, div, font,
-    prelude::*, px, rgb, size,
+    MouseButton, MouseMoveEvent, PathPromptOptions, SharedString, Window, WindowBounds,
+    WindowOptions, div, font, prelude::*, px, rgb, size,
 };
 
 use crate::host::{Endpoint, Layout, PANE_COUNT, Reply, Request, Snapshot};
 
 const HEADER_HEIGHT: f32 = 44.0;
+const STATUS_HEIGHT: f32 = 25.0;
 const SIDEBAR_WIDTH: f32 = 252.0;
 const PANE_HEADER_HEIGHT: f32 = 29.0;
 const PADDING: f32 = 8.0;
@@ -28,8 +30,8 @@ const MONO_FONT: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const MONO_FONT: &str = "DejaVu Sans Mono";
 
-pub fn run(endpoint: Endpoint, agents: bool) -> Result<()> {
-    endpoint.ensure_host(agents, &env::current_dir()?)?;
+pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {
+    endpoint.ensure_host(agents, desktop, &env::current_dir()?)?;
     let (send, requests) = mpsc::channel();
     let (updates, receive) = mpsc::channel();
     thread::spawn(move || client(endpoint, requests, updates));
@@ -49,7 +51,7 @@ pub fn run(endpoint: Endpoint, agents: bool) -> Result<()> {
                 ..Default::default()
             },
             |window, cx| {
-                window.set_window_title("Edith • GPUI terminal prototype");
+                window.set_window_title("Edith");
                 cx.new(move |cx| {
                     let focus = cx.focus_handle();
                     focus.focus(window);
@@ -81,13 +83,18 @@ pub fn run(endpoint: Endpoint, agents: bool) -> Result<()> {
                         active: 0,
                         requests: send,
                         updates: receive,
-                        panes: Default::default(),
+                        panes: Vec::new(),
+                        desktop,
+                        sidebar_visible: true,
+                        projects: Vec::new(),
+                        terminal_projects: Vec::new(),
+                        codex: None,
                         project_dir: String::new(),
                         connected: false,
                         layout: Layout::default(),
                         initial_layout: false,
                         drag: None,
-                        sizes: [(0, 0); PANE_COUNT],
+                        sizes: Vec::new(),
                         cell_width,
                         status: "Conectando con el proceso de terminales…".into(),
                     }
@@ -101,21 +108,31 @@ pub fn run(endpoint: Endpoint, agents: bool) -> Result<()> {
 }
 
 fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Result<Reply>>) {
-    let mut revisions = [0; PANE_COUNT];
+    let mut revisions = Vec::new();
+    let mut workspace = Default::default();
     let mut next_poll = Instant::now();
     let mut initial = true;
     let mut disconnected = false;
     loop {
         if Instant::now() >= next_poll {
-            let result = endpoint.request(Request::Poll(revisions));
+            let result = endpoint.request(Request::Poll(revisions.clone()));
             next_poll = Instant::now() + INTERVAL;
             match result {
                 Ok(Reply::State {
                     layout,
                     project_dir,
                     panes,
+                    projects,
+                    codex,
+                    terminal_projects,
                 }) => {
-                    let changed = initial || disconnected || panes.iter().any(Option::is_some);
+                    let metadata = (projects, codex, terminal_projects);
+                    let changed = initial
+                        || disconnected
+                        || workspace != metadata
+                        || panes.iter().any(Option::is_some);
+                    workspace = metadata;
+                    revisions.resize(panes.len(), 0);
                     initial = false;
                     disconnected = false;
                     for (index, pane) in panes.iter().enumerate() {
@@ -129,6 +146,9 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                                 layout,
                                 project_dir,
                                 panes,
+                                projects: workspace.0.clone(),
+                                codex: workspace.1.clone(),
+                                terminal_projects: workspace.2.clone(),
                             }))
                             .is_err()
                     {
@@ -138,7 +158,7 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                 Ok(_) => {}
                 Err(error) if !disconnected => {
                     disconnected = true;
-                    revisions = [0; PANE_COUNT];
+                    revisions.clear();
                     if updates.send(Err(error)).is_err() {
                         return;
                     }
@@ -172,18 +192,244 @@ struct Workspace {
     active: usize,
     requests: Sender<Request>,
     updates: Receiver<Result<Reply>>,
-    panes: [Snapshot; PANE_COUNT],
+    panes: Vec<Snapshot>,
+    desktop: bool,
+    sidebar_visible: bool,
+    projects: Vec<PathBuf>,
+    terminal_projects: Vec<PathBuf>,
+    codex: Option<PathBuf>,
     project_dir: String,
     connected: bool,
     layout: Layout,
     initial_layout: bool,
     drag: Option<Divider>,
-    sizes: [(u16, u16); PANE_COUNT],
+    sizes: Vec<(u16, u16)>,
     cell_width: f32,
     status: SharedString,
 }
 
 impl Workspace {
+    fn desktop(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let bounds = window.viewport_size();
+        let sidebar_width = if self.sidebar_visible {
+            SIDEBAR_WIDTH
+        } else {
+            0.0
+        };
+        let width = (f32::from(bounds.width) - sidebar_width).max(0.0);
+        let show_status = self.status.as_ref() != "Host conectado";
+        let status_height = if show_status { STATUS_HEIGHT } else { 0.0 };
+        let height = (f32::from(bounds.height) - HEADER_HEIGHT - status_height).max(0.0);
+        let mut terminal = div().flex().flex_col().w(px(width)).min_w_0();
+        if self.panes.is_empty() {
+            terminal = terminal.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0x929daf))
+                    .child(if self.projects.is_empty() {
+                        "Añade un repositorio para empezar."
+                    } else {
+                        "Inicia Codex desde un repositorio."
+                    }),
+            );
+        } else {
+            self.resize(self.active, width, height);
+            terminal = terminal.child(self.pane(self.active, width, height, cx));
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .text_color(rgb(0xd9e0ee))
+            .bg(rgb(0x11151d))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::key_down))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(HEADER_HEIGHT))
+                    .bg(rgb(0x171d28))
+                    .border_b_1()
+                    .border_color(rgb(0x2a3344))
+                    .child(
+                        div().px_2().flex_none().child(
+                            button(if self.sidebar_visible {
+                                "Ocultar barra lateral"
+                            } else {
+                                "Mostrar barra lateral"
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, window, cx| {
+                                    view.sidebar_visible = !view.sidebar_visible;
+                                    view.focus.focus(window);
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("terminal-tabs")
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap(px(4.0))
+                            .overflow_x_scroll()
+                            .children(self.terminal_projects.iter().enumerate().map(
+                                |(index, project)| {
+                                    self.session_button(
+                                        index,
+                                        format!("{} · Codex {}", project_name(project), index + 1),
+                                        cx,
+                                    )
+                                    .flex_none()
+                                },
+                            )),
+                    ),
+            )
+            .when(show_status, |root| {
+                root.child(
+                    div()
+                        .h(px(STATUS_HEIGHT))
+                        .flex_none()
+                        .truncate()
+                        .px_3()
+                        .py_1()
+                        .bg(rgb(0x34283a))
+                        .text_size(px(12.0))
+                        .child(self.status.clone()),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .when(self.sidebar_visible, |row| {
+                        row.child(self.desktop_sidebar(cx))
+                    })
+                    .child(terminal),
+            )
+    }
+
+    fn desktop_sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("workspace-sidebar")
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .flex_none()
+            .overflow_y_scroll()
+            .bg(rgb(0x171d28))
+            .border_r_1()
+            .border_color(rgb(0x2a3344))
+            .p_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .mb_3()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Proyectos"),
+                    )
+                    .child(button("+ Añadir repositorio").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| view.choose_path(false, cx)),
+                    )),
+            )
+            .children(self.projects.iter().map(|project| {
+                let root = project.clone();
+                div()
+                    .mb_4()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(rgb(0x2a3344))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(14.0))
+                            .child(project_name(project).to_owned()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .mb_2()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x929daf))
+                            .child(project.display().to_string()),
+                    )
+                    .children(
+                        self.terminal_projects
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, owner)| *owner == project)
+                            .map(|(index, _)| {
+                                let state = if self.panes[index].exited {
+                                    "Cerrada"
+                                } else if self.connected {
+                                    "Abierta"
+                                } else {
+                                    "Sin conexión"
+                                };
+                                self.session_button(
+                                    index,
+                                    format!("Codex {} · {state}", index + 1),
+                                    cx,
+                                )
+                                .mb_1()
+                            }),
+                    )
+                    .child(button("Iniciar Codex").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.send(Request::StartCodex(root.clone()), cx)
+                        }),
+                    ))
+            }))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xaeb8c9))
+                    .child(div().truncate().mb_2().child(match &self.codex {
+                        Some(path) => path.display().to_string(),
+                        None => "Codex · Detectar en PATH".into(),
+                    }))
+                    .child(button("Elegir ejecutable").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| view.choose_path(true, cx)),
+                    ))
+                    .when(self.codex.is_some(), |row| {
+                        row.child(button("Usar detección automática").mt_1().on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| view.send(Request::SetCodex(None), cx)),
+                        ))
+                    }),
+            )
+    }
+
+    fn session_button(&self, index: usize, label: String, cx: &Context<Self>) -> Div {
+        button(label)
+            .when(index == self.active, |button| {
+                button.bg(rgb(0x2b405a)).text_color(rgb(0xf1f5ff))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _, window, cx| {
+                    view.focus_pane(index, window, cx);
+                }),
+            )
+    }
+
     fn refresh(&mut self) -> bool {
         let mut changed = false;
         for update in self.updates.try_iter() {
@@ -193,25 +439,41 @@ impl Workspace {
                     layout,
                     project_dir,
                     panes,
+                    projects,
+                    codex,
+                    terminal_projects,
                 }) => {
+                    if self.initial_layout && self.desktop && panes.len() > self.panes.len() {
+                        self.active = panes.len() - 1;
+                    }
+                    self.projects = projects;
+                    self.codex = codex;
+                    self.terminal_projects = terminal_projects;
+                    self.panes.resize_with(panes.len(), Snapshot::default);
+                    self.sizes.resize(panes.len(), (0, 0));
+                    if self.active >= panes.len() {
+                        self.active = 0;
+                    }
                     if !self.initial_layout {
                         self.layout = layout;
                         self.initial_layout = true;
                     }
                     self.project_dir = project_dir;
+                    if !self.connected {
+                        self.status = "Host conectado".into();
+                    }
                     self.connected = true;
                     for (index, pane) in panes.into_iter().enumerate() {
                         if let Some(snapshot) = pane {
                             self.panes[index] = snapshot;
                         }
                     }
-                    self.status = "Host conectado".into();
                 }
                 Ok(Reply::Error(error)) => self.status = format!("Host: {error}").into(),
                 Ok(Reply::Ok) => {}
                 Err(error) => {
                     self.connected = false;
-                    self.sizes = [(0, 0); PANE_COUNT];
+                    self.sizes.fill((0, 0));
                     self.status = format!("Host: {error}").into();
                 }
             }
@@ -219,22 +481,66 @@ impl Workspace {
         changed
     }
 
-    fn resize(&mut self, widths: [f32; PANE_COUNT], heights: [f32; PANE_COUNT]) {
-        if !self.initial_layout || !self.connected {
+    fn resize(&mut self, pane: usize, width: f32, height: f32) {
+        if !self.initial_layout || !self.connected || self.panes[pane].exited {
             return;
         }
-        for pane in 0..PANE_COUNT {
-            let rows =
-                (((heights[pane] - PANE_HEADER_HEIGHT - 2.0 * PADDING) / LINE_HEIGHT).floor()
-                    as u16)
-                    .clamp(2, 200);
-            let cols =
-                (((widths[pane] - 2.0 * PADDING) / self.cell_width).floor() as u16).clamp(2, 300);
-            if self.sizes[pane] != (rows, cols) {
-                self.sizes[pane] = (rows, cols);
-                let _ = self.requests.send(Request::Resize { pane, rows, cols });
-            }
+        let rows = (((height - PANE_HEADER_HEIGHT - 2.0 * PADDING) / LINE_HEIGHT).floor() as u16)
+            .clamp(2, 200);
+        let cols = (((width - 2.0 * PADDING) / self.cell_width).floor() as u16).clamp(2, 300);
+        if self.sizes[pane] != (rows, cols) {
+            self.sizes[pane] = (rows, cols);
+            let _ = self.requests.send(Request::Resize { pane, rows, cols });
         }
+    }
+
+    fn send(&mut self, request: Request, cx: &mut Context<Self>) {
+        self.status = if self.requests.send(request).is_ok() {
+            "Host conectado".into()
+        } else {
+            "Sin conexión con el host".into()
+        };
+        cx.notify();
+    }
+
+    fn choose_path(&self, executable: bool, cx: &mut Context<Self>) {
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: executable,
+            directories: !executable,
+            multiple: false,
+            prompt: Some(
+                if executable {
+                    "Elegir ejecutable"
+                } else {
+                    "Añadir repositorio"
+                }
+                .into(),
+            ),
+        });
+        cx.spawn(async move |this, cx| match selected.await {
+            Ok(Err(error)) => {
+                _ = this.update(cx, |view, cx| {
+                    view.status = error.to_string().into();
+                    cx.notify();
+                });
+            }
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    _ = this.update(cx, |view, cx| {
+                        view.send(
+                            if executable {
+                                Request::SetCodex(Some(path))
+                            } else {
+                                Request::AddProject(path)
+                            },
+                            cx,
+                        );
+                    });
+                }
+            }
+            _ => {}
+        })
+        .detach();
     }
 
     fn drag_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -425,7 +731,9 @@ impl Workspace {
         let snapshot = &self.panes[index];
         let (rows, cols) = self.sizes[index];
         let focused = self.active == index;
-        let label = if snapshot.label.is_empty() {
+        let label = if self.desktop {
+            "Codex"
+        } else if snapshot.label.is_empty() {
             "Terminal"
         } else {
             &snapshot.label
@@ -460,7 +768,11 @@ impl Workspace {
                     .px(px(PADDING))
                     .bg(rgb(if focused { 0x263b53 } else { 0x1c2431 }))
                     .text_size(px(12.0))
-                    .child(format!("{}  {label}", index + 1))
+                    .child(if self.desktop {
+                        self.terminal_projects[index].display().to_string()
+                    } else {
+                        format!("{}  {label}", index + 1)
+                    })
                     .child(div().text_color(rgb(0xaab8cc)).child(status)),
             )
             .child(
@@ -501,7 +813,7 @@ impl Workspace {
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.active;
-        if !self.connected || self.panes[pane].exited {
+        if !self.connected || self.panes.get(pane).is_none_or(|pane| pane.exited) {
             return;
         }
         let key = &event.keystroke;
@@ -538,13 +850,21 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds = window.viewport_size();
+        if self.desktop {
+            return self.desktop(window, cx).into_any_element();
+        }
         let width = (f32::from(bounds.width) - SIDEBAR_WIDTH).max(0.0);
         let height = (f32::from(bounds.height) - HEADER_HEIGHT).max(0.0);
         let left = (width - DIVIDER).max(0.0) * self.layout.left;
         let right = (width - DIVIDER - left).max(0.0);
         let top = (height - DIVIDER).max(0.0) * self.layout.top;
         let bottom = (height - DIVIDER - top).max(0.0);
-        self.resize([left, right, right], [height, top, bottom]);
+        if self.panes.len() != PANE_COUNT {
+            return div().child(self.status.clone()).into_any_element();
+        }
+        self.resize(0, left, height);
+        self.resize(1, right, top);
+        self.resize(2, right, bottom);
 
         div()
             .size_full()
@@ -600,7 +920,27 @@ impl Render for Workspace {
                             .child(self.pane(2, right, bottom, cx)),
                     ),
             )
+            .into_any_element()
     }
+}
+
+fn button(text: impl Into<SharedString>) -> Div {
+    div()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .bg(rgb(0x222b3b))
+        .hover(|style| style.bg(rgb(0x34465e)))
+        .cursor(CursorStyle::PointingHand)
+        .whitespace_nowrap()
+        .child(text.into())
+}
+
+fn project_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Repositorio")
 }
 
 fn terminal_key(stroke: &Keystroke, application_cursor: bool) -> Option<Vec<u8>> {

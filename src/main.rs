@@ -10,31 +10,42 @@ use host::{Endpoint, Layout, PANE_COUNT, Reply, Request, Snapshot};
 
 fn main() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
-    let endpoint = Endpoint::find()?;
+    let desktop = !args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--agents" | "--prototype" | "--host"));
+    let endpoint = Endpoint::find(desktop)?;
     match args
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["--host"] => endpoint.serve(false),
-        ["--host", "--agents"] => endpoint.serve(true),
+        ["--desktop-host"] => endpoint.serve(false, true),
+        ["--host"] => endpoint.serve(false, false),
+        ["--host", "--agents"] => endpoint.serve(true, false),
         ["--stop-host"] => {
             endpoint.request(Request::Stop)?;
             Ok(())
         }
         ["--status"] => {
-            let (layout, panes) = state(&endpoint)?;
+            let Reply::State { layout, panes, .. } = endpoint.request(Request::Poll(vec![]))?
+            else {
+                bail!("host did not return terminal state");
+            };
             println!("Layout: {layout:?}");
-            for pane in panes {
+            for pane in panes.into_iter().flatten() {
                 println!("{} PID {:?}; exited: {}", pane.label, pane.pid, pane.exited);
             }
             Ok(())
         }
         ["--smoke-test"] => smoke_test(),
-        [] | ["--agents"] => {
+        [] | ["--agents"] | ["--prototype"] => {
             #[cfg(feature = "ui")]
-            return ui::run(endpoint, !args.is_empty());
+            return ui::run(
+                endpoint,
+                args.first().is_some_and(|arg| arg == "--agents"),
+                desktop,
+            );
             #[cfg(not(feature = "ui"))]
             bail!("rebuild with the default ui feature to open a window");
         }
@@ -45,15 +56,19 @@ fn main() -> Result<()> {
 }
 
 fn state(endpoint: &Endpoint) -> Result<(Layout, [Snapshot; PANE_COUNT])> {
-    let Reply::State { layout, panes, .. } = endpoint.request(Request::Poll([0; PANE_COUNT]))?
+    let Reply::State { layout, panes, .. } =
+        endpoint.request(Request::Poll(vec![0; PANE_COUNT]))?
     else {
         bail!("host did not return terminal state");
     };
     ensure!(
-        panes.iter().all(Option::is_some),
+        panes.len() == PANE_COUNT && panes.iter().all(Option::is_some),
         "host did not return every pane"
     );
-    Ok((layout, panes.map(Option::unwrap)))
+    Ok((
+        layout,
+        std::array::from_fn(|index| panes[index].clone().unwrap()),
+    ))
 }
 
 fn smoke_test() -> Result<()> {
@@ -63,7 +78,7 @@ fn smoke_test() -> Result<()> {
     #[cfg(target_os = "macos")]
     let path = std::path::Path::new("/tmp").join(path.file_name().unwrap());
     let endpoint = Endpoint::at(path);
-    endpoint.ensure_host(false, &env::current_dir()?)?;
+    endpoint.ensure_host(false, false, &env::current_dir()?)?;
     let result = exercise_shells(&endpoint);
     let stop = endpoint.request(Request::Stop);
     result?;

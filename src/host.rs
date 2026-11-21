@@ -1,7 +1,8 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,7 +54,11 @@ pub struct Run {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    Poll([u64; PANE_COUNT]),
+    Poll(Vec<u64>),
+    DesktopReady,
+    AddProject(PathBuf),
+    SetCodex(Option<PathBuf>),
+    StartCodex(PathBuf),
     Input { pane: usize, bytes: Vec<u8> },
     Resize { pane: usize, rows: u16, cols: u16 },
     SetLayout(Layout),
@@ -66,7 +71,13 @@ pub enum Reply {
         layout: Layout,
         #[serde(default)]
         project_dir: String,
-        panes: [Option<Snapshot>; PANE_COUNT],
+        panes: Vec<Option<Snapshot>>,
+        #[serde(default)]
+        projects: Vec<PathBuf>,
+        #[serde(default)]
+        codex: Option<PathBuf>,
+        #[serde(default)]
+        terminal_projects: Vec<PathBuf>,
     },
     Ok,
     Error(String),
@@ -77,12 +88,16 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub fn find() -> Result<Self> {
+    pub fn find(desktop: bool) -> Result<Self> {
         let dir = match env::var_os("EDITH_PROTOTYPE_STATE") {
             Some(dir) => env::current_dir()?.join(dir),
             None => dirs::cache_dir()
                 .context("could not find the current user's cache directory")?
-                .join("edith-gpui-prototype"),
+                .join(if desktop {
+                    "edith"
+                } else {
+                    "edith-gpui-prototype"
+                }),
         };
         Ok(Self::at(dir))
     }
@@ -145,12 +160,20 @@ impl Endpoint {
         }
     }
 
-    pub fn ensure_host(&self, agents: bool, work_dir: &std::path::Path) -> Result<()> {
-        if self.request(Request::Poll([u64::MAX; PANE_COUNT])).is_ok() {
+    pub fn ensure_host(&self, agents: bool, desktop: bool, work_dir: &Path) -> Result<()> {
+        let ready = || {
+            self.request(if desktop {
+                Request::DesktopReady
+            } else {
+                Request::Poll(vec![u64::MAX; PANE_COUNT])
+            })
+            .is_ok()
+        };
+        if ready() {
             return Ok(());
         }
         let mut command = Command::new(env::current_exe()?);
-        command.arg("--host");
+        command.arg(if desktop { "--desktop-host" } else { "--host" });
         if agents {
             command.arg("--agents");
         }
@@ -174,7 +197,7 @@ impl Endpoint {
         }
         let mut child = command.spawn().context("could not launch the PTY host")?;
         for _ in 0..100 {
-            if self.request(Request::Poll([u64::MAX; PANE_COUNT])).is_ok() {
+            if ready() {
                 return Ok(());
             }
             if let Some(status) = child.try_wait()? {
@@ -192,7 +215,7 @@ impl Endpoint {
         bail!("the PTY host did not become ready")
     }
 
-    pub fn serve(&self, agents: bool) -> Result<()> {
+    pub fn serve(&self, agents: bool, desktop: bool) -> Result<()> {
         let _lock = self.lock()?;
         let project_dir = env::current_dir()?.to_string_lossy().into_owned();
         // The lock guarantees that replacing a stale Unix socket cannot displace
@@ -207,8 +230,8 @@ impl Endpoint {
             [shell_program(), shell_program(), shell_program()]
         };
         let mut terminals = Vec::with_capacity(PANE_COUNT);
-        for program in programs {
-            let terminal = match Terminal::new(&program, agents) {
+        for program in programs.into_iter().filter(|_| !desktop) {
+            let terminal = match Terminal::new(&program, agents, Path::new(&project_dir)) {
                 Ok(terminal) => Ok(terminal),
                 Err(error) if agents => Err(unavailable_agent(&program, &error)),
                 Err(error) => return Err(error),
@@ -216,13 +239,22 @@ impl Endpoint {
             terminals.push(terminal);
         }
         let mut layout = Layout::default();
+        let mut workspace = WorkspaceState::default();
 
         for connection in listener.incoming() {
             let mut connection = connection?;
             let request = read_message(BufReader::new(&mut connection), MAX_REQUEST_BYTES);
             let stop = matches!(request, Ok(Request::Stop));
             let reply = request
-                .and_then(|request| dispatch(&mut terminals, &mut layout, &project_dir, request))
+                .and_then(|request| {
+                    dispatch(
+                        &mut terminals,
+                        &mut layout,
+                        &project_dir,
+                        Some(&mut workspace).filter(|_| desktop),
+                        request,
+                    )
+                })
                 .unwrap_or_else(|error| Reply::Error(error.to_string()));
             // A UI may disconnect in the middle of a request.
             _ = write_message(&mut connection, &reply);
@@ -258,25 +290,66 @@ fn read_message<T: serde::de::DeserializeOwned>(reader: impl BufRead, limit: u64
     Ok(serde_json::from_slice(&line)?)
 }
 
+#[derive(Default)]
+struct WorkspaceState {
+    projects: Vec<PathBuf>,
+    codex: Option<PathBuf>,
+    terminal_projects: Vec<PathBuf>,
+}
+
+fn repository_root(path: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .context("No se pudo ejecutar Git")?;
+    ensure!(
+        output.status.success(),
+        "Selecciona una carpeta de un repositorio Git"
+    );
+    let root = std::str::from_utf8(&output.stdout)?
+        .strip_suffix('\n')
+        .unwrap_or_default()
+        .trim_end_matches('\r');
+    let root = PathBuf::from(root);
+    #[cfg(unix)]
+    let root = root.canonicalize()?;
+    ensure!(root.is_absolute(), "Git no devolvió un directorio absoluto");
+    ensure!(
+        root.join(".git").is_dir(),
+        "Selecciona el directorio principal del repositorio"
+    );
+    Ok(root)
+}
+
 fn dispatch(
-    terminals: &mut [Result<Terminal, Snapshot>],
+    terminals: &mut Vec<Result<Terminal, Snapshot>>,
     layout: &mut Layout,
     project_dir: &str,
+    mut workspace: Option<&mut WorkspaceState>,
     request: Request,
 ) -> Result<Reply> {
     match request {
         Request::Poll(seen) => {
-            let mut panes = std::array::from_fn(|_| None);
+            let mut panes = Vec::with_capacity(terminals.len());
             for (pane, terminal) in terminals.iter_mut().enumerate() {
-                panes[pane] = match terminal {
-                    Ok(terminal) => terminal.snapshot(seen[pane])?,
-                    Err(snapshot) => (snapshot.revision > seen[pane]).then(|| snapshot.clone()),
-                };
+                let revision = seen.get(pane).copied().unwrap_or_default();
+                panes.push(match terminal {
+                    Ok(terminal) => terminal.snapshot(revision)?,
+                    Err(snapshot) => (snapshot.revision > revision).then(|| snapshot.clone()),
+                });
             }
             return Ok(Reply::State {
                 layout: *layout,
                 project_dir: project_dir.into(),
                 panes,
+                projects: workspace
+                    .as_ref()
+                    .map_or_else(Vec::new, |state| state.projects.clone()),
+                codex: workspace.as_ref().and_then(|state| state.codex.clone()),
+                terminal_projects: workspace
+                    .as_ref()
+                    .map_or_else(Vec::new, |state| state.terminal_projects.clone()),
             });
         }
         Request::Input { pane, bytes } => terminals
@@ -296,9 +369,85 @@ fn dispatch(
                 top: position.top.clamp(0.15, 0.85),
             };
         }
+        Request::DesktopReady => ensure!(workspace.is_some(), "expected the desktop host"),
+        Request::AddProject(path) => {
+            let state = workspace
+                .as_mut()
+                .context("workspace action requires the desktop host")?;
+            let root = repository_root(&path)?;
+            if !state.projects.contains(&root) {
+                state.projects.push(root);
+            }
+        }
+        Request::SetCodex(path) => {
+            let state = workspace
+                .as_mut()
+                .context("workspace action requires the desktop host")?;
+            if let Some(path) = &path {
+                ensure!(
+                    path.is_absolute() && is_executable(path),
+                    "Selecciona un ejecutable de Codex"
+                );
+            }
+            state.codex = path;
+        }
+        Request::StartCodex(project) => {
+            let state = workspace
+                .as_mut()
+                .context("workspace action requires the desktop host")?;
+            ensure!(
+                state.projects.contains(&project),
+                "Añade el repositorio antes de iniciar Codex"
+            );
+            let detected;
+            let program = match &state.codex {
+                Some(custom) => custom,
+                None => {
+                    detected = detect_codex().context(
+                        "Codex no está en PATH. Elige su ejecutable desde la barra lateral.",
+                    )?;
+                    &detected
+                }
+            };
+            let terminal = Terminal::new(program.as_os_str(), true, &project)
+                .with_context(|| format!("No se pudo iniciar Codex desde {}", program.display()))?;
+            terminals.push(Ok(terminal));
+            state.terminal_projects.push(project);
+        }
         Request::Stop => {}
     }
     Ok(Reply::Ok)
+}
+
+fn detect_codex() -> Option<PathBuf> {
+    let path = env::var_os("PATH").unwrap_or_default();
+    #[cfg(windows)]
+    let names = ["codex.exe", "codex.cmd", "codex.bat"];
+    #[cfg(unix)]
+    let names = ["codex"];
+
+    env::split_paths(&path)
+        .filter(|directory| directory.is_absolute())
+        .flat_map(|directory| names.map(|name| directory.join(name)))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(windows)]
+    {
+        path.is_file()
+            && path.extension().is_some_and(|ext| {
+                ["exe", "cmd", "bat"]
+                    .iter()
+                    .any(|kind| ext.eq_ignore_ascii_case(kind))
+            })
+    }
 }
 
 fn unavailable_agent(program: &std::ffi::OsStr, error: &anyhow::Error) -> Snapshot {
@@ -335,7 +484,7 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn new(program: &std::ffi::OsStr, agent: bool) -> Result<Self> {
+    fn new(program: &std::ffi::OsStr, agent: bool, cwd: &Path) -> Result<Self> {
         let rows = 24;
         let cols = 80;
         let pair = native_pty_system().openpty(pty_size(rows, cols))?;
@@ -344,20 +493,30 @@ impl Terminal {
             .unwrap_or(program)
             .to_string_lossy()
             .into_owned();
-        let mut command = if cfg!(windows) && agent {
+        let direct_exe = Path::new(program)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+        let mut command = if cfg!(windows) && agent && !direct_exe {
             // Native npm installations can expose an agent as a .cmd shim.
-            // The three allowed agent names are fixed by the prototype.
+            // Never interpret a user-selected path as shell syntax.
+            ensure!(
+                !program
+                    .to_string_lossy()
+                    .contains(['&', '|', '<', '>', '^', '%', '!', '(', ')', '"', '\n', '\r']),
+                "La ruta del script no es compatible con cmd.exe"
+            );
             let mut command = CommandBuilder::new(shell_program());
             command.args([
-                std::ffi::OsStr::new("/d"),
-                std::ffi::OsStr::new("/c"),
+                OsStr::new("/d"),
+                OsStr::new("/v:off"),
+                OsStr::new("/c"),
                 program,
             ]);
             command
         } else {
             CommandBuilder::new(program)
         };
-        command.cwd(env::current_dir()?);
+        command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         let child = pair
             .slave
