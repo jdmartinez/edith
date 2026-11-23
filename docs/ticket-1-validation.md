@@ -23,6 +23,12 @@ En macOS, ejecuta `SHELL=/bin/sh cargo run --locked --no-default-features -- --s
 
 ## Pendientes
 
-- Ejecutar los flujos de escritorio y agentes en Windows nativo, incluyendo el smoke test con ConPTY.
-- Probar GitHub Copilot CLI en ambos sistemas y una conversación autenticada de Claude Code en macOS.
+- Ejecutar los flujos interactivos de escritorio y agentes en una sesión de Windows nativo.
+- Comprobar teclado y redimensionado en GitHub Copilot CLI y una conversación autenticada de Claude Code en macOS.
 - Revisar el redibujado bajo carga y otras entradas de terminal de los agentes antes de confirmar GPUI y vt100 para la aplicación.
+
+## Validación automatizada nativa
+
+El [workflow Native validation](../.github/workflows/native-validation.yml) ejecuta las pruebas Rust sin interfaz, el smoke test de tres shells ConPTY con redimensionado y reconexión, y la compilación de GPUI en un runner Windows Server 2025. La validación interactiva de ventanas, divisores y teclado requiere una sesión de escritorio.
+
+El [fixture de Copilot CLI](../tests/copilot_native.py) ejecuta la distribución independiente 1.0.114 en macOS y Windows con un proveedor simulado por HTTP en localhost y una configuración temporal. Comprueba que `session.usage_record` conserva el modelo, el identificador, la marca temporal, la duración y los contadores, incluidos los ceros medidos. La comprobación local en macOS ARM64 registró 42 tokens de entrada, 5 de salida y ceros en caché de lectura y razonamiento. El fixture funciona sin credenciales y la comprobación de Windows queda a cargo del resultado del workflow. [Ticket 13](https://github.com/jdmartinez/edith/issues/13) · [Configuración de Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference)
