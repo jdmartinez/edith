@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -7,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui::{
-    App, Application, Bounds, Context, CursorStyle, Div, FocusHandle, KeyDownEvent, Keystroke,
-    MouseButton, MouseMoveEvent, PathPromptOptions, SharedString, Window, WindowBounds,
-    WindowOptions, div, font, prelude::*, px, rgb, size,
+    App, Application, AssetSource, Bounds, Context, CursorStyle, Div, FocusHandle, KeyDownEvent,
+    Keystroke, MouseButton, MouseMoveEvent, PathPromptOptions, SharedString, Window, WindowBounds,
+    WindowOptions, div, font, prelude::*, px, rgb, size, svg,
 };
 
-use crate::host::{Endpoint, Layout, PANE_COUNT, Reply, Repository, Request, Snapshot};
+use crate::host::{Agent, Endpoint, Layout, PANE_COUNT, Reply, Repository, Request, Snapshot};
 
 const HEADER_HEIGHT: f32 = 44.0;
 const STATUS_HEIGHT: f32 = 25.0;
@@ -37,7 +38,8 @@ pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {
     let (updates, receive) = mpsc::channel();
     thread::spawn(move || client(endpoint, requests, updates));
 
-    Application::new().run(move |cx: &mut App| {
+    let app = Application::new().with_assets(AgentIcons);
+    app.run(move |cx: &mut App| {
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -92,7 +94,8 @@ pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {
                         discovery: None,
                         selected_projects: BTreeSet::new(),
                         terminal_projects: Vec::new(),
-                        codex: None,
+                        agent_executables: BTreeMap::new(),
+                        choosing_agent: None,
                         project_dir: String::new(),
                         connected: false,
                         layout: Layout::default(),
@@ -128,10 +131,10 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                     panes,
                     projects,
                     worktrees,
-                    codex,
+                    agent_executables,
                     terminal_projects,
                 }) => {
-                    let metadata = (projects, worktrees, codex, terminal_projects);
+                    let metadata = (projects, worktrees, agent_executables, terminal_projects);
                     let changed = initial
                         || disconnected
                         || workspace != metadata
@@ -153,7 +156,7 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                                 panes,
                                 projects: workspace.0.clone(),
                                 worktrees: workspace.1.clone(),
-                                codex: workspace.2.clone(),
+                                agent_executables: workspace.2.clone(),
                                 terminal_projects: workspace.3.clone(),
                             }))
                             .is_err()
@@ -202,7 +205,7 @@ enum Divider {
 enum PathAction {
     AddProject,
     ScanProjects,
-    ChooseCodex,
+    ChooseExecutable(Agent),
 }
 
 struct Workspace {
@@ -218,7 +221,8 @@ struct Workspace {
     discovery: Option<Vec<Repository>>,
     selected_projects: BTreeSet<PathBuf>,
     terminal_projects: Vec<PathBuf>,
-    codex: Option<PathBuf>,
+    agent_executables: BTreeMap<Agent, PathBuf>,
+    choosing_agent: Option<PathBuf>,
     project_dir: String,
     connected: bool,
     layout: Layout,
@@ -253,7 +257,7 @@ impl Workspace {
                     .child(if self.projects.is_empty() {
                         "Añade un repositorio para empezar."
                     } else {
-                        "Inicia Codex desde un repositorio."
+                        "Abre una sesión desde un proyecto."
                     }),
             );
         } else {
@@ -308,7 +312,12 @@ impl Workspace {
                                 |(index, project)| {
                                     self.session_button(
                                         index,
-                                        format!("{} · Codex {}", project_name(project), index + 1),
+                                        format!(
+                                            "{} · {} {}",
+                                            project_name(project),
+                                            self.session_agent(index).name(),
+                                            index + 1
+                                        ),
                                         cx,
                                     )
                                     .flex_none()
@@ -426,37 +435,89 @@ impl Workspace {
                                 };
                                 self.session_button(
                                     index,
-                                    format!("Codex {} · {state}", index + 1),
+                                    format!(
+                                        "{} {} · {state}",
+                                        self.session_agent(index).name(),
+                                        index + 1
+                                    ),
                                     cx,
                                 )
                                 .mb_1()
                             }),
                     )
-                    .child(button("Iniciar Codex").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |view, _, _, cx| {
-                            view.send(Request::StartCodex(root.clone()), cx)
-                        }),
-                    ))
+                    .child(
+                        button(if self.choosing_agent.as_ref() == Some(project) {
+                            "Cancelar"
+                        } else {
+                            "+ Nueva sesión"
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, _, _, cx| {
+                                view.choosing_agent = (view.choosing_agent.as_ref() != Some(&root))
+                                    .then(|| root.clone());
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .when(self.choosing_agent.as_ref() == Some(project), |row| {
+                        row.children(Agent::ALL.map(|agent| {
+                            let project = project.clone();
+                            icon_button(agent, agent.name()).mt_1().on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |view, _, _, cx| {
+                                    view.choosing_agent = None;
+                                    view.send(
+                                        Request::StartSession {
+                                            project: project.clone(),
+                                            agent,
+                                        },
+                                        cx,
+                                    );
+                                }),
+                            )
+                        }))
+                    })
             }))
             .child(
                 div()
                     .text_size(px(12.0))
                     .text_color(rgb(0xaeb8c9))
-                    .child(div().truncate().mb_2().child(match &self.codex {
-                        Some(path) => path.display().to_string(),
-                        None => "Codex · Detectar en PATH".into(),
-                    }))
-                    .child(button("Elegir ejecutable").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|view, _, _, cx| view.choose_path(PathAction::ChooseCodex, cx)),
-                    ))
-                    .when(self.codex.is_some(), |row| {
-                        row.child(button("Usar detección automática").mt_1().on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|view, _, _, cx| view.send(Request::SetCodex(None), cx)),
-                        ))
-                    }),
+                    .child("Ejecutables de agentes")
+                    .children(Agent::ALL.map(|agent| {
+                        let custom = self.agent_executables.get(&agent);
+                        div()
+                            .mt_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(agent_icon(agent))
+                                    .child(agent.name()),
+                            )
+                            .child(div().truncate().mb_1().child(custom.map_or_else(
+                                || "Detección automática".into(),
+                                |path| path.display().to_string(),
+                            )))
+                            .child(button("Elegir ejecutable").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |view, _, _, cx| {
+                                    view.choose_path(PathAction::ChooseExecutable(agent), cx)
+                                }),
+                            ))
+                            .when(custom.is_some(), |row| {
+                                row.child(button("Usar detección automática").mt_1().on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |view, _, _, cx| {
+                                        view.send(
+                                            Request::SetAgentExecutable { agent, path: None },
+                                            cx,
+                                        )
+                                    }),
+                                ))
+                            })
+                    })),
             )
     }
 
@@ -527,8 +588,12 @@ impl Workspace {
             )
     }
 
+    fn session_agent(&self, index: usize) -> Agent {
+        self.panes[index].agent.unwrap_or(Agent::Codex)
+    }
+
     fn session_button(&self, index: usize, label: String, cx: &Context<Self>) -> Div {
-        button(label)
+        icon_button(self.session_agent(index), label)
             .when(index == self.active, |button| {
                 button.bg(rgb(0x2b405a)).text_color(rgb(0xf1f5ff))
             })
@@ -551,7 +616,7 @@ impl Workspace {
                     panes,
                     projects,
                     worktrees,
-                    codex,
+                    agent_executables,
                     terminal_projects,
                 }) => {
                     if self.initial_layout && self.desktop && panes.len() > self.panes.len() {
@@ -559,7 +624,7 @@ impl Workspace {
                     }
                     self.projects = projects;
                     self.worktrees = worktrees;
-                    self.codex = codex;
+                    self.agent_executables = agent_executables;
                     self.terminal_projects = terminal_projects;
                     self.panes.resize_with(panes.len(), Snapshot::default);
                     self.sizes.resize(panes.len(), (0, 0));
@@ -624,16 +689,18 @@ impl Workspace {
     }
 
     fn choose_path(&self, action: PathAction, cx: &mut Context<Self>) {
-        let executable = matches!(action, PathAction::ChooseCodex);
+        let executable = matches!(action, PathAction::ChooseExecutable(_));
         let selected = cx.prompt_for_paths(PathPromptOptions {
             files: executable,
             directories: !executable,
             multiple: false,
             prompt: Some(
                 match action {
-                    PathAction::AddProject => "Añadir repositorio",
-                    PathAction::ScanProjects => "Escanear carpeta",
-                    PathAction::ChooseCodex => "Elegir ejecutable",
+                    PathAction::AddProject => "Añadir repositorio".into(),
+                    PathAction::ScanProjects => "Escanear carpeta".into(),
+                    PathAction::ChooseExecutable(agent) => {
+                        format!("Elegir ejecutable de {}", agent.name())
+                    }
                 }
                 .into(),
             ),
@@ -650,7 +717,10 @@ impl Workspace {
                     _ = this.update(cx, |view, cx| {
                         let request = match action {
                             PathAction::AddProject => Request::AddProject(path),
-                            PathAction::ChooseCodex => Request::SetCodex(Some(path)),
+                            PathAction::ChooseExecutable(agent) => Request::SetAgentExecutable {
+                                agent,
+                                path: Some(path),
+                            },
                             PathAction::ScanProjects => {
                                 view.discovery = None;
                                 view.selected_projects.clear();
@@ -860,7 +930,7 @@ impl Workspace {
         let (rows, cols) = self.sizes[index];
         let focused = self.active == index;
         let label = if self.desktop {
-            "Codex"
+            self.session_agent(index).name()
         } else if snapshot.label.is_empty() {
             "Terminal"
         } else {
@@ -1052,7 +1122,55 @@ impl Render for Workspace {
     }
 }
 
+struct AgentIcons;
+
+impl AssetSource for AgentIcons {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        let bytes: &[u8] = match path {
+            "claude.svg" => include_bytes!("../assets/agents/claude.svg"),
+            "codex.svg" => include_bytes!("../assets/agents/codex.svg"),
+            "copilot.svg" => include_bytes!("../assets/agents/copilot.svg"),
+            _ => return Ok(None),
+        };
+        Ok(Some(Cow::Borrowed(bytes)))
+    }
+
+    fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
+        Ok(vec![
+            "claude.svg".into(),
+            "codex.svg".into(),
+            "copilot.svg".into(),
+        ])
+    }
+}
+
+fn agent_icon(agent: Agent) -> impl IntoElement {
+    let (path, color) = match agent {
+        Agent::Claude => ("claude.svg", 0xe89172),
+        Agent::Codex => ("codex.svg", 0xf0f1f2),
+        Agent::Copilot => ("copilot.svg", 0xc8bcf4),
+    };
+    svg()
+        .path(path)
+        .size(px(15.0))
+        .flex_none()
+        .text_color(rgb(color))
+}
+
+fn icon_button(agent: Agent, text: impl Into<SharedString>) -> Div {
+    button_style()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .child(agent_icon(agent))
+        .child(div().min_w_0().truncate().child(text.into()))
+}
+
 fn button(text: impl Into<SharedString>) -> Div {
+    button_style().child(text.into())
+}
+
+fn button_style() -> Div {
     div()
         .px_2()
         .py_1()
@@ -1062,7 +1180,6 @@ fn button(text: impl Into<SharedString>) -> Div {
         .hover(|style| style.bg(rgb(0x34465e)))
         .cursor(CursorStyle::PointingHand)
         .whitespace_nowrap()
-        .child(text.into())
 }
 
 fn project_name(path: &Path) -> &str {
