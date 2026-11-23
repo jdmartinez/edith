@@ -33,8 +33,7 @@ impl Host {
     }
 }
 
-#[test]
-fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnection() {
+fn start_host() -> Host {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -60,6 +59,12 @@ fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnectio
         thread::sleep(Duration::from_millis(20));
     }
 
+    host
+}
+
+#[test]
+fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnection() {
+    let mut host = start_host();
     let repo = host.state.join("project");
     fs::create_dir_all(repo.join("subfolder")).unwrap();
     assert!(
@@ -124,4 +129,115 @@ fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnectio
     }
     assert_eq!(host.request(json!("Stop")), "Ok");
     assert!(host.child.wait().unwrap().success());
+}
+
+#[test]
+fn scanning_only_adds_selected_clones_and_preserves_running_sessions() {
+    let host = start_host();
+    let container = host.state.join("container");
+    let first = container.join("a/clone");
+    let second = container.join("b/clone");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    fs::create_dir(container.join("plain")).unwrap();
+
+    fn git(directory: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .current_dir(directory)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    for clone in [&first, &second] {
+        git(clone, &["init", "-q"]);
+        git(
+            clone,
+            &[
+                "-c",
+                "user.name=Edith",
+                "-c",
+                "user.email=edith@example.com",
+                "commit",
+                "-qm",
+                "initial",
+                "--allow-empty",
+            ],
+        );
+        git(
+            clone,
+            &["remote", "add", "origin", "https://example.com/shared.git"],
+        );
+    }
+    git(
+        &first,
+        &["worktree", "add", "-q", "--detach", "../../first worktree"],
+    );
+    git(
+        &second,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            "../../../second worktree",
+        ],
+    );
+    let first = first.canonicalize().unwrap();
+    let second = second.canonicalize().unwrap();
+    let first_tree = container.join("first worktree").canonicalize().unwrap();
+    let second_tree = host.state.join("second worktree").canonicalize().unwrap();
+
+    let results = host.request(json!({"ScanProjects": container}));
+    assert_eq!(
+        results,
+        json!({"Discovered":[
+            {"root":first,"worktrees":[first_tree]},
+            {"root":second,"worktrees":[second_tree]}
+        ]})
+    );
+    assert_eq!(
+        host.request(json!({"Poll": []}))["State"]["projects"],
+        json!([])
+    );
+    assert_eq!(
+        host.request(json!({"AddDiscoveredProjects":[second]})),
+        "Ok"
+    );
+
+    let codex = host.state.join("codex");
+    fs::write(&codex, "#!/bin/sh\nread line\n").unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(host.request(json!({"StartCodex":second})), "Ok");
+    let before = host.request(json!({"Poll": []}));
+    assert_eq!(before["State"]["projects"], json!([second]));
+    assert_eq!(
+        before["State"]["worktrees"][second.to_str().unwrap()],
+        json!([second_tree])
+    );
+    assert_eq!(before["State"]["terminal_projects"], json!([second]));
+
+    let remaining = host.request(json!({"ScanProjects":container}));
+    assert_eq!(
+        remaining,
+        json!({"Discovered":[{"root":first,"worktrees":[first_tree]}]})
+    );
+    assert_eq!(
+        host.request(json!({"AddDiscoveredProjects":[first, first]})),
+        "Ok"
+    );
+    let after = host.request(json!({"Poll": []}));
+    assert_eq!(after["State"]["projects"], json!([second, first]));
+    assert_eq!(
+        after["State"]["worktrees"][first.to_str().unwrap()],
+        json!([first_tree])
+    );
+    assert_eq!(after["State"]["terminal_projects"], json!([second]));
+    assert_eq!(
+        after["State"]["panes"][0]["pid"],
+        before["State"]["panes"][0]["pid"]
+    );
+    assert_eq!(after["State"]["panes"][0]["exited"], false);
 }

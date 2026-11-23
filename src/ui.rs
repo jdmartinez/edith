@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -11,7 +12,7 @@ use gpui::{
     WindowOptions, div, font, prelude::*, px, rgb, size,
 };
 
-use crate::host::{Endpoint, Layout, PANE_COUNT, Reply, Request, Snapshot};
+use crate::host::{Endpoint, Layout, PANE_COUNT, Reply, Repository, Request, Snapshot};
 
 const HEADER_HEIGHT: f32 = 44.0;
 const STATUS_HEIGHT: f32 = 25.0;
@@ -87,6 +88,9 @@ pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {
                         desktop,
                         sidebar_visible: true,
                         projects: Vec::new(),
+                        worktrees: BTreeMap::new(),
+                        discovery: None,
+                        selected_projects: BTreeSet::new(),
                         terminal_projects: Vec::new(),
                         codex: None,
                         project_dir: String::new(),
@@ -123,10 +127,11 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                     project_dir,
                     panes,
                     projects,
+                    worktrees,
                     codex,
                     terminal_projects,
                 }) => {
-                    let metadata = (projects, codex, terminal_projects);
+                    let metadata = (projects, worktrees, codex, terminal_projects);
                     let changed = initial
                         || disconnected
                         || workspace != metadata
@@ -147,8 +152,9 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                                 project_dir,
                                 panes,
                                 projects: workspace.0.clone(),
-                                codex: workspace.1.clone(),
-                                terminal_projects: workspace.2.clone(),
+                                worktrees: workspace.1.clone(),
+                                codex: workspace.2.clone(),
+                                terminal_projects: workspace.3.clone(),
                             }))
                             .is_err()
                     {
@@ -169,10 +175,15 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
 
         match requests.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
             Ok(request) => {
-                if let Err(error) = endpoint.request(request) {
-                    if updates.send(Ok(Reply::Error(error.to_string()))).is_err() {
-                        return;
-                    }
+                let adding = matches!(request, Request::AddDiscoveredProjects(_));
+                let update = match endpoint.request(request) {
+                    Ok(reply @ Reply::Discovered(_)) => reply,
+                    Ok(Reply::Ok) if adding => Reply::Ok,
+                    Err(error) => Reply::Error(error.to_string()),
+                    _ => continue,
+                };
+                if updates.send(Ok(update)).is_err() {
+                    return;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -187,6 +198,13 @@ enum Divider {
     Rows,
 }
 
+#[derive(Clone, Copy)]
+enum PathAction {
+    AddProject,
+    ScanProjects,
+    ChooseCodex,
+}
+
 struct Workspace {
     focus: FocusHandle,
     active: usize,
@@ -196,6 +214,9 @@ struct Workspace {
     desktop: bool,
     sidebar_visible: bool,
     projects: Vec<PathBuf>,
+    worktrees: BTreeMap<PathBuf, Vec<PathBuf>>,
+    discovery: Option<Vec<Repository>>,
+    selected_projects: BTreeSet<PathBuf>,
     terminal_projects: Vec<PathBuf>,
     codex: Option<PathBuf>,
     project_dir: String,
@@ -344,9 +365,16 @@ impl Workspace {
                     )
                     .child(button("+ Añadir repositorio").on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|view, _, _, cx| view.choose_path(false, cx)),
+                        cx.listener(|view, _, _, cx| view.choose_path(PathAction::AddProject, cx)),
                     )),
             )
+            .child(button("Escanear carpeta…").mb_3().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, _, cx| view.choose_path(PathAction::ScanProjects, cx)),
+            ))
+            .when_some(self.discovery.as_ref(), |sidebar, candidates| {
+                sidebar.child(self.discovery_panel(candidates, cx))
+            })
             .children(self.projects.iter().map(|project| {
                 let root = project.clone();
                 div()
@@ -367,6 +395,21 @@ impl Workspace {
                             .text_size(px(11.0))
                             .text_color(rgb(0x929daf))
                             .child(project.display().to_string()),
+                    )
+                    .children(
+                        self.worktrees
+                            .get(project)
+                            .into_iter()
+                            .flatten()
+                            .map(|path| {
+                                div()
+                                    .pl_2()
+                                    .mb_1()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0xaeb8c9))
+                                    .child(format!("Worktree · {}", project_name(path)))
+                                    .child(div().child(path.display().to_string()))
+                            }),
                     )
                     .children(
                         self.terminal_projects
@@ -406,7 +449,7 @@ impl Workspace {
                     }))
                     .child(button("Elegir ejecutable").on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|view, _, _, cx| view.choose_path(true, cx)),
+                        cx.listener(|view, _, _, cx| view.choose_path(PathAction::ChooseCodex, cx)),
                     ))
                     .when(self.codex.is_some(), |row| {
                         row.child(button("Usar detección automática").mt_1().on_mouse_down(
@@ -414,6 +457,73 @@ impl Workspace {
                             cx.listener(|view, _, _, cx| view.send(Request::SetCodex(None), cx)),
                         ))
                     }),
+            )
+    }
+
+    fn discovery_panel(&self, candidates: &[Repository], cx: &Context<Self>) -> Div {
+        div()
+            .mb_3()
+            .pb_3()
+            .border_b_1()
+            .border_color(rgb(0x2a3344))
+            .child(if candidates.is_empty() {
+                "No hay repositorios nuevos."
+            } else {
+                "Selecciona los repositorios que quieras añadir."
+            })
+            .children(candidates.iter().map(|candidate| {
+                let root = candidate.root.clone();
+                let selected = self.selected_projects.contains(&root);
+                button(format!(
+                    "{} {}",
+                    if selected { "☑" } else { "☐" },
+                    project_name(&root)
+                ))
+                .mt_1()
+                .child(
+                    div()
+                        .id(SharedString::from(root.display().to_string()))
+                        .overflow_x_scroll()
+                        .whitespace_nowrap()
+                        .text_size(px(11.0))
+                        .child(root.display().to_string()),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        if !view.selected_projects.remove(&root) {
+                            view.selected_projects.insert(root.clone());
+                        }
+                        cx.notify();
+                    }),
+                )
+            }))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .mt_2()
+                    .when(!self.selected_projects.is_empty(), |row| {
+                        row.child(button("Añadir seleccionados").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| {
+                                view.send(
+                                    Request::AddDiscoveredProjects(
+                                        view.selected_projects.iter().cloned().collect(),
+                                    ),
+                                    cx,
+                                );
+                            }),
+                        ))
+                    })
+                    .child(button("Cerrar").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            view.discovery = None;
+                            view.selected_projects.clear();
+                            cx.notify();
+                        }),
+                    )),
             )
     }
 
@@ -440,6 +550,7 @@ impl Workspace {
                     project_dir,
                     panes,
                     projects,
+                    worktrees,
                     codex,
                     terminal_projects,
                 }) => {
@@ -447,6 +558,7 @@ impl Workspace {
                         self.active = panes.len() - 1;
                     }
                     self.projects = projects;
+                    self.worktrees = worktrees;
                     self.codex = codex;
                     self.terminal_projects = terminal_projects;
                     self.panes.resize_with(panes.len(), Snapshot::default);
@@ -470,7 +582,15 @@ impl Workspace {
                     }
                 }
                 Ok(Reply::Error(error)) => self.status = format!("Host: {error}").into(),
-                Ok(Reply::Ok) => {}
+                Ok(Reply::Discovered(candidates)) => {
+                    self.discovery = Some(candidates);
+                    self.selected_projects.clear();
+                    self.status = "Host conectado".into();
+                }
+                Ok(Reply::Ok) => {
+                    self.discovery = None;
+                    self.selected_projects.clear();
+                }
                 Err(error) => {
                     self.connected = false;
                     self.sizes.fill((0, 0));
@@ -503,16 +623,17 @@ impl Workspace {
         cx.notify();
     }
 
-    fn choose_path(&self, executable: bool, cx: &mut Context<Self>) {
+    fn choose_path(&self, action: PathAction, cx: &mut Context<Self>) {
+        let executable = matches!(action, PathAction::ChooseCodex);
         let selected = cx.prompt_for_paths(PathPromptOptions {
             files: executable,
             directories: !executable,
             multiple: false,
             prompt: Some(
-                if executable {
-                    "Elegir ejecutable"
-                } else {
-                    "Añadir repositorio"
+                match action {
+                    PathAction::AddProject => "Añadir repositorio",
+                    PathAction::ScanProjects => "Escanear carpeta",
+                    PathAction::ChooseCodex => "Elegir ejecutable",
                 }
                 .into(),
             ),
@@ -527,14 +648,21 @@ impl Workspace {
             Ok(Ok(Some(paths))) => {
                 if let Some(path) = paths.into_iter().next() {
                     _ = this.update(cx, |view, cx| {
-                        view.send(
-                            if executable {
-                                Request::SetCodex(Some(path))
-                            } else {
-                                Request::AddProject(path)
-                            },
-                            cx,
-                        );
+                        let request = match action {
+                            PathAction::AddProject => Request::AddProject(path),
+                            PathAction::ChooseCodex => Request::SetCodex(Some(path)),
+                            PathAction::ScanProjects => {
+                                view.discovery = None;
+                                view.selected_projects.clear();
+                                Request::ScanProjects(path)
+                            }
+                        };
+                        view.send(request, cx);
+                        if matches!(action, PathAction::ScanProjects)
+                            && view.status.as_ref() == "Host conectado"
+                        {
+                            view.status = "Escaneando carpeta…".into();
+                        }
                     });
                 }
             }
