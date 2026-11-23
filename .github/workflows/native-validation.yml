@@ -17,8 +17,9 @@ jobs:
         with:
           persist-credentials: false
       - run: cargo test --locked --no-default-features
-      - run: cargo run --locked --no-default-features -- --smoke-test
       - run: cargo build --locked
+      - if: ${{ !cancelled() }}
+        run: cargo run --locked --no-default-features -- --smoke-test
 
   copilot-cli:
     name: Copilot CLI event log (${{ matrix.os }})

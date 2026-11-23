@@ -10,6 +10,9 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use super::protocol::{Agent, Run, Snapshot};
 
+#[cfg(windows)]
+mod conpty;
+
 pub(super) fn shell_program() -> std::ffi::OsString {
     #[cfg(unix)]
     return env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
@@ -88,7 +91,7 @@ use super::attention::{self, AttentionStatus, ClaudeHook};
 
 pub(super) struct Terminal {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: PtyWriter,
     child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
     label: String,
@@ -101,6 +104,11 @@ pub(super) struct Terminal {
     attention: AttentionStatus,
     resume_error: Option<String>,
 }
+
+#[cfg(not(windows))]
+type PtyWriter = Box<dyn Write + Send>;
+#[cfg(windows)]
+type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 impl Terminal {
     pub(super) fn link_codex_conversation(&mut self) -> Result<()> {
@@ -190,6 +198,10 @@ impl Terminal {
         let pid = child.process_id();
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
+        #[cfg(windows)]
+        let writer = Arc::new(Mutex::new(writer));
+        #[cfg(windows)]
+        let query_writer = Arc::clone(&writer);
         let screen = Arc::new(Mutex::new(Screen {
             parser: vt100::Parser::new(rows, cols, 512),
             revision,
@@ -197,13 +209,28 @@ impl Terminal {
         let screen_reader = Arc::clone(&screen);
         thread::spawn(move || {
             let mut buffer = [0; 8192];
+            #[cfg(windows)]
+            let mut queries = conpty::Queries::default();
             while let Ok(count) = reader.read(&mut buffer) {
                 if count == 0 {
                     break;
                 }
                 let mut screen = screen_reader.lock().unwrap();
+                #[cfg(not(windows))]
                 screen.parser.process(&buffer[..count]);
+                #[cfg(windows)]
+                let replies = queries.process(&mut screen.parser, &buffer[..count]);
                 screen.revision += 1;
+                #[cfg(windows)]
+                {
+                    drop(screen);
+                    if !replies.is_empty()
+                        && let Err(error) = query_writer.lock().unwrap().write_all(&replies)
+                        && error.kind() != std::io::ErrorKind::BrokenPipe
+                    {
+                        eprintln!("could not answer a ConPTY query: {error}");
+                    }
+                }
             }
         });
         Ok(Self {
@@ -246,8 +273,12 @@ impl Terminal {
 
     pub(super) fn input(&mut self, bytes: &[u8]) -> Result<()> {
         ensure!(!self.exited, "terminal has exited");
-        self.writer.write_all(bytes)?;
-        self.writer.flush()?;
+        #[cfg(windows)]
+        let mut writer = self.writer.lock().unwrap();
+        #[cfg(not(windows))]
+        let writer = &mut self.writer;
+        writer.write_all(bytes)?;
+        writer.flush()?;
         Ok(())
     }
 
