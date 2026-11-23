@@ -1,5 +1,8 @@
 use gpui::{Context, Div, KeyDownEvent, MouseButton, div, prelude::*, rgb};
 
+use crate::usage::UsageAgent;
+use crate::usage_panel::{Period, agent_name};
+
 use crate::ui::controls::button;
 
 use super::Workspace;
@@ -65,7 +68,72 @@ impl Workspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .child(self.usage_filters(cx))
                     .child(self.usage.content()),
             )
     }
+    fn usage_filters(&self, cx: &Context<Self>) -> Div {
+        let filters = &self.usage.filters;
+        let periods = Period::OPTIONS.into_iter().map(|(period, label)| {
+            filter_button(label, filters.period == period).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _, _, cx| {
+                    view.usage.filters.period = period;
+                    cx.notify();
+                }),
+            )
+        });
+        let agents = [
+            None,
+            Some(UsageAgent::Codex),
+            Some(UsageAgent::Claude),
+            Some(UsageAgent::Copilot),
+        ]
+        .into_iter()
+        .map(|agent| {
+            filter_button(agent.map_or("Todos", agent_name), filters.agent == agent).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _, _, cx| {
+                    view.usage.filters.agent = agent;
+                    cx.notify();
+                }),
+            )
+        });
+        let models = std::iter::once(None)
+            .chain(self.usage.models().into_iter().map(Some))
+            .map(|model| {
+                let selected = filters.model.as_deref() == model;
+                let value = model.map(str::to_owned);
+                filter_button(model.unwrap_or("Todos"), selected).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        view.usage.filters.model = value.clone();
+                        cx.notify();
+                    }),
+                )
+            });
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .child(filter_row("Periodo").children(periods))
+            .child(filter_row("Agente").children(agents))
+            .child(filter_row("Modelo").children(models))
+    }
+}
+
+fn filter_row(label: &'static str) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .child(div().text_sm().child(label))
+}
+
+fn filter_button(label: &str, selected: bool) -> Div {
+    button(label.to_owned()).when(selected, |control| {
+        control.bg(rgb(0x385371)).border_color(rgb(0x87e0cd))
+    })
 }
