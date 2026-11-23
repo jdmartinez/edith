@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Datelike, Timelike};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 
 use crate::usage::{UsageAgent, UsageEvent};
 
@@ -15,10 +15,13 @@ pub(super) struct Summary {
     pub(super) models: BTreeMap<String, Totals>,
 }
 
-pub(super) fn summarize(events: &[UsageEvent], filters: &Filters, current_day: i64) -> Summary {
-    let mut summary = Summary::default();
+pub(super) fn selected<'a>(
+    events: &'a [UsageEvent],
+    filters: &'a Filters,
+    current_day: i64,
+) -> impl Iterator<Item = (&'a UsageEvent, DateTime<Utc>)> {
     let first_day = filters.period.first_day(current_day);
-    for event in events {
+    events.iter().filter_map(move |event| {
         let day = event.timestamp.div_euclid(86_400);
         if first_day.is_some_and(|first| day < first || day > current_day)
             || filters.agent.is_some_and(|agent| agent != event.agent)
@@ -27,11 +30,16 @@ pub(super) fn summarize(events: &[UsageEvent], filters: &Filters, current_day: i
                 .as_ref()
                 .is_some_and(|model| *model != event.model)
         {
-            continue;
+            return None;
         }
-        let Some(date) = DateTime::from_timestamp(event.timestamp, 0) else {
-            continue;
-        };
+        DateTime::from_timestamp(event.timestamp, 0).map(|date| (event, date))
+    })
+}
+
+pub(super) fn summarize(events: &[UsageEvent], filters: &Filters, current_day: i64) -> Summary {
+    let mut summary = Summary::default();
+    for (event, date) in selected(events, filters, current_day) {
+        let day = event.timestamp.div_euclid(86_400);
         summary.total.add(event);
         summary.days.entry(day).or_default().add(event);
         summary

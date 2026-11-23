@@ -1,4 +1,4 @@
-use gpui::{Context, Div, KeyDownEvent, MouseButton, div, prelude::*, rgb};
+use gpui::{Context, Div, KeyDownEvent, MouseButton, PathPromptOptions, div, prelude::*, rgb};
 
 use crate::usage::UsageAgent;
 use crate::usage_panel::{Period, agent_name};
@@ -69,9 +69,39 @@ impl Workspace {
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(self.usage_filters(cx))
-                    .child(self.usage.content()),
+                    .child(self.usage.content())
+                    .child(self.usage.billing_content(self.billing_button(cx))),
             )
     }
+
+    fn billing_button(&self, cx: &Context<Self>) -> Div {
+        if self.usage.loading_billing() {
+            return div().text_sm().child("Leyendo informe…");
+        }
+        div().child(button("Abrir informe JSON").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, _, cx| {
+                let selected = cx.prompt_for_paths(PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: Some("Abrir informe de costes".into()),
+                });
+                cx.spawn(async move |view, cx| {
+                    if let Ok(Ok(Some(paths))) = selected.await
+                        && let Some(path) = paths.into_iter().next()
+                    {
+                        _ = view.update(cx, |view, cx| {
+                            view.usage.load_billing_report(path);
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }),
+        ))
+    }
+
     fn usage_filters(&self, cx: &Context<Self>) -> Div {
         let filters = &self.usage.filters;
         let periods = Period::OPTIONS.into_iter().map(|(period, label)| {

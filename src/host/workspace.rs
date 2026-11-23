@@ -13,6 +13,10 @@ use super::git::{
 use super::protocol::{Agent, Layout, Reply, Request, SessionTarget, Snapshot};
 use super::terminal::{Terminal, detect_agent, is_executable};
 
+mod persistence;
+
+pub(super) use persistence::WorkspaceStore;
+
 #[derive(Default)]
 pub(super) struct WorkspaceState {
     layout: DesktopLayout,
@@ -321,6 +325,18 @@ pub(super) fn dispatch(
             terminals.push(Ok(terminal));
             state.terminal_projects.push(project);
         }
+        Request::LinkConversation { pane, conversation } => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            let terminal = terminals
+                .get_mut(pane)
+                .context("Sesión desconocida")?
+                .as_mut()
+                .map_err(|_| anyhow::anyhow!("La sesión ya está cerrada"))?;
+            terminal.link_codex_conversation()?;
+            let id = uuid::Uuid::parse_str(conversation.trim())
+                .context("Introduce un UUID de conversación válido")?;
+            state.conversations.insert(pane, id);
+        }
         Request::ResumeSession { pane, conversation } => {
             let state = workspace.context("workspace action requires the desktop host")?;
             let terminal = terminals.get_mut(pane).context("Sesión desconocida")?;
@@ -349,27 +365,10 @@ pub(super) fn dispatch(
                     .get(&pane)
                     .context("Vincula el UUID exacto de la conversación antes de reanudarla")?
             };
-            let id = id.to_string();
-            let args = match agent {
-                Agent::Codex => ["resume", id.as_str()],
-                Agent::Claude | Agent::Copilot => ["--resume", id.as_str()],
-            };
             let revision = previous.revision + 1;
-            let next = agent_program(state, agent).and_then(|program| {
-                Terminal::launch(
-                    program.as_os_str(),
-                    true,
-                    &previous.directory,
-                    &args,
-                    revision,
-                )
-                .with_context(|| format!("No se pudo reanudar {}", agent.name()))
-            });
-            match next {
-                Ok(mut next) => {
+            match reattach(state, &previous, agent, id, revision) {
+                Ok(next) => {
                     state.layout.show(pane)?;
-                    next.set_agent(agent);
-                    next.retain_on_resume_failure(previous);
                     *terminal = Ok(next);
                 }
                 Err(error) => {
@@ -382,6 +381,35 @@ pub(super) fn dispatch(
         Request::Stop => {}
     }
     Ok(Reply::Ok)
+}
+
+fn reattach(
+    state: &WorkspaceState,
+    previous: &Snapshot,
+    agent: Agent,
+    id: uuid::Uuid,
+    revision: u64,
+) -> Result<Terminal> {
+    let id = id.to_string();
+    let args = match agent {
+        Agent::Codex => ["resume", id.as_str()],
+        Agent::Claude | Agent::Copilot => ["--resume", id.as_str()],
+    };
+    let program = agent_program(state, agent)?;
+    let mut next = Terminal::launch(
+        program.as_os_str(),
+        true,
+        &previous.directory,
+        &args,
+        revision,
+    )
+    .with_context(|| format!("No se pudo reanudar {}", agent.name()))?;
+    next.set_agent(agent);
+    let mut backup = previous.clone();
+    backup.exited = true;
+    backup.pid = None;
+    next.retain_on_resume_failure(backup);
+    Ok(next)
 }
 
 fn agent_program(state: &WorkspaceState, agent: Agent) -> Result<PathBuf> {

@@ -115,6 +115,10 @@ pub enum Request {
         #[serde(default)]
         conversation: Option<String>,
     },
+    LinkConversation {
+        pane: usize,
+        conversation: String,
+    },
     Input {
         pane: usize,
         bytes: Vec<u8>,

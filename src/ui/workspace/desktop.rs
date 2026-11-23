@@ -309,6 +309,29 @@ impl Workspace {
             .gap_1()
             .rounded_md()
             .bg(rgb(0x171d28))
+            .when(
+                self.panes.get(pane).is_some_and(|snapshot| {
+                    snapshot.agent == Some(crate::host::Agent::Codex) && !snapshot.exited
+                }),
+                |menu| {
+                    menu.child(button("Vincular UUID de Codex").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, window, cx| {
+                            view.panel_menu = None;
+                            view.focus.focus(window);
+                            if let Some(conversation) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                view.send(Request::LinkConversation { pane, conversation }, cx);
+                            } else {
+                                view.status = "Copia el UUID de la conversación de Codex.".into();
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        }),
+                    ))
+                },
+            )
             .children(
                 [
                     (
