@@ -103,6 +103,16 @@ impl Terminal {
         self.agent = Some(agent);
     }
 
+    pub(super) fn link_codex_conversation(&mut self) -> Result<()> {
+        ensure!(
+            self.agent == Some(Agent::Codex),
+            "Esta sesión no pertenece a Codex"
+        );
+        ensure!(!self.exited, "La sesión ya está cerrada");
+        self.screen.lock().unwrap().revision += 1;
+        Ok(())
+    }
+
     pub(super) fn is_running_in(&mut self, path: &Path) -> Result<bool> {
         Ok(self.directory == path && !self.exited && self.child.try_wait()?.is_none())
     }

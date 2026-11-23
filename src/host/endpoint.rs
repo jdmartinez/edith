@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use super::protocol::{Agent, Layout, PANE_COUNT, Reply, Request};
 use super::terminal::{Terminal, shell_program, unavailable_agent};
-use super::workspace::{WorkspaceState, dispatch};
+use super::workspace::{WorkspaceStore, dispatch};
 
 const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 
@@ -172,7 +172,9 @@ impl Endpoint {
             terminals.push(terminal);
         }
         let mut layout = Layout::default();
-        let mut workspace = WorkspaceState::default();
+        let mut desktop_state = desktop
+            .then(|| WorkspaceStore::open(&self.dir, &mut terminals))
+            .transpose()?;
 
         for connection in listener.incoming() {
             let mut connection = connection?;
@@ -180,18 +182,27 @@ impl Endpoint {
             let stop = matches!(request, Ok(Request::Stop));
             let reply = request
                 .and_then(|request| {
-                    dispatch(
+                    let save = WorkspaceStore::saves_request(&request);
+                    let reply = dispatch(
                         &mut terminals,
                         &mut layout,
                         &project_dir,
-                        desktop.then_some(&mut workspace),
+                        desktop_state.as_mut().map(|(_, workspace)| workspace),
                         request,
-                    )
+                    )?;
+                    if let Some((store, workspace)) = desktop_state.as_mut()
+                        && (save || store.saw_exit(&reply))
+                    {
+                        store
+                            .save(workspace, &mut terminals)
+                            .context("No se pudo guardar el espacio de trabajo")?;
+                    }
+                    Ok(reply)
                 })
                 .unwrap_or_else(|error| Reply::Error(error.to_string()));
             // A UI may disconnect in the middle of a request.
             _ = write_message(&mut connection, &reply);
-            if stop {
+            if stop && !matches!(reply, Reply::Error(_)) {
                 break;
             }
         }

@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{BufReader, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command},
     sync::atomic::{AtomicUsize, Ordering},
     thread,
@@ -31,6 +31,26 @@ impl Host {
         let mut socket = UnixStream::connect(self.state.join("host.sock")).unwrap();
         writeln!(socket, "{request}").unwrap();
         serde_json::from_reader(BufReader::new(socket)).unwrap()
+    }
+
+    fn restart(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        fs::remove_file(self.state.join("host.sock")).unwrap();
+        self.child = spawn_host(&self.state);
+        self.wait_until_ready();
+    }
+
+    fn wait_until_ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(self.state.join("host.sock")).is_err() {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "desktop host exited"
+            );
+            assert!(Instant::now() < deadline, "desktop host did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -62,25 +82,20 @@ fn start_host() -> Host {
     ));
     fs::create_dir(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_edith-gpui-prototype"))
+    let child = spawn_host(&state);
+    let mut host = Host { child, state };
+    host.wait_until_ready();
+    host
+}
+
+fn spawn_host(state: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_edith-gpui-prototype"))
         .arg("--desktop-host")
-        .env("EDITH_PROTOTYPE_STATE", &state)
+        .env("EDITH_PROTOTYPE_STATE", state)
         .env("PATH", format!("{}:/usr/bin:/bin", state.display()))
         .env("CODEX_HOME", "edith-test-home")
         .spawn()
-        .unwrap();
-    let mut host = Host { child, state };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !host.state.join("host.sock").exists() {
-        assert!(
-            host.child.try_wait().unwrap().is_none(),
-            "desktop host exited"
-        );
-        assert!(Instant::now() < deadline, "desktop host did not start");
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    host
+        .unwrap()
 }
 
 fn exercise_agent(agent: &str, executable: &str) {
@@ -753,4 +768,121 @@ fn a_failed_resume_keeps_closed_output_and_retries_the_same_conversation() {
         host.request(json!({"Poll": []}))["State"]["desktop_layout"]["root"],
         json!({"Pane": 0})
     );
+}
+
+#[test]
+fn restarting_the_host_restores_hidden_sessions_and_keeps_failed_retries_separate() {
+    let (mut host, repo) = panel_host();
+    let executable = host.state.join("agent-fixture");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+case "$1" in
+--session-id) printf '%s\n' "$2" > conversation; echo ORIGINAL; read line;;
+--resume)
+    test "$#" = 2 && test "$2" = "$(cat conversation)" || exit 7
+    test -f resume-enabled || exit 8
+    echo REATTACHED
+    read line
+    ;;
+resume)
+    test "$#" = 2 && test "$2" = "0804cb57-2fd0-4bc5-86c6-7e9cfd3e4521" || exit 9
+    echo CODEX_REATTACHED
+    read line
+    ;;
+*) echo CODEX_ORIGINAL; read line;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let failed_executable = host.state.join("copilot-fixture");
+    fs::write(
+        &failed_executable,
+        "#!/bin/sh\ncase \"$1\" in\n--session-id) printf '%s\\n' \"$2\" > copilot-conversation; echo COPILOT_ORIGINAL; read line;;\n--resume) test \"$#\" = 2 && test \"$2\" = \"$(cat copilot-conversation)\" || exit 8; test -f copilot-enabled || exit 9; echo COPILOT_REATTACHED; read line;;\n*) exit 10;;\nesac\n",
+    ).unwrap();
+    fs::set_permissions(&failed_executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    for (agent, path) in [
+        ("Claude", &executable),
+        ("Codex", &executable),
+        ("Copilot", &failed_executable),
+    ] {
+        assert_eq!(
+            host.request(json!({"SetAgentExecutable": {"agent": agent, "path": path}})),
+            "Ok"
+        );
+        assert_eq!(
+            host.request(json!({"StartSession": {"agent": agent, "project": repo}})),
+            "Ok"
+        );
+    }
+    assert_eq!(
+        host.request(json!({"LinkConversation": {
+            "pane": 1,
+            "conversation": "0804cb57-2fd0-4bc5-86c6-7e9cfd3e4521"
+        }})),
+        "Ok"
+    );
+
+    fn await_state(host: &Host, predicate: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reply = host.request(json!({"Poll": []}));
+            let state = &reply["State"];
+            if predicate(state) {
+                return state.clone();
+            }
+            assert!(Instant::now() < deadline, "{reply}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    await_state(&host, |state| {
+        state["panes"][0]["lines"].to_string().contains("ORIGINAL")
+            && state["panes"][1]["lines"]
+                .to_string()
+                .contains("CODEX_ORIGINAL")
+            && state["panes"][2]["lines"]
+                .to_string()
+                .contains("COPILOT_ORIGINAL")
+    });
+    panel_action(&host, json!({"Show": {"pane": 1}}));
+    panel_action(&host, json!({"Resize": {"path": [], "ratio": 0.62}}));
+    let before = host.request(json!({"Poll": []}))["State"].clone();
+    fs::write(repo.join("resume-enabled"), "").unwrap();
+
+    host.restart();
+    let recovered = await_state(&host, |state| {
+        state["panes"][0]["lines"]
+            .to_string()
+            .contains("REATTACHED")
+            && state["panes"][1]["lines"]
+                .to_string()
+                .contains("CODEX_REATTACHED")
+            && state["panes"][2]["resume_error"].is_string()
+    });
+    assert_eq!(recovered["desktop_layout"], before["desktop_layout"]);
+    assert_eq!(recovered["projects"], before["projects"]);
+    assert_eq!(recovered["agent_executables"], before["agent_executables"]);
+    assert_eq!(recovered["panes"][0]["exited"], false);
+    assert_eq!(recovered["panes"][1]["exited"], false);
+    assert_eq!(recovered["panes"][2]["exited"], true);
+    assert!(
+        recovered["panes"][2]["lines"]
+            .to_string()
+            .contains("COPILOT_ORIGINAL")
+    );
+    assert_ne!(recovered["panes"][0]["pid"], before["panes"][0]["pid"]);
+
+    fs::write(repo.join("copilot-enabled"), "").unwrap();
+    assert_eq!(host.request(json!({"ResumeSession": {"pane": 2}})), "Ok");
+    let retried = await_state(&host, |state| {
+        state["panes"][2]["lines"]
+            .to_string()
+            .contains("COPILOT_REATTACHED")
+    });
+    assert_eq!(retried["panes"][2]["exited"], false);
+    assert_eq!(retried["panes"][0]["pid"], recovered["panes"][0]["pid"]);
+    assert_eq!(retried["panes"][1]["pid"], recovered["panes"][1]["pid"]);
 }
