@@ -65,6 +65,8 @@ pub struct Snapshot {
     pub label: String,
     #[serde(default)]
     pub agent: Option<Agent>,
+    #[serde(default)]
+    pub directory: PathBuf,
     pub pid: Option<u32>,
     pub exited: bool,
     pub application_cursor: bool,
@@ -89,12 +91,53 @@ pub enum Request {
     AddProject(PathBuf),
     ScanProjects(PathBuf),
     AddDiscoveredProjects(Vec<PathBuf>),
-    SetAgentExecutable { agent: Agent, path: Option<PathBuf> },
-    StartSession { project: PathBuf, agent: Agent },
-    Input { pane: usize, bytes: Vec<u8> },
-    Resize { pane: usize, rows: u16, cols: u16 },
+    SetAgentExecutable {
+        agent: Agent,
+        path: Option<PathBuf>,
+    },
+    SessionDirectories(PathBuf),
+    StartSession {
+        project: PathBuf,
+        agent: Agent,
+        #[serde(default)]
+        target: SessionTarget,
+    },
+    Input {
+        pane: usize,
+        bytes: Vec<u8>,
+    },
+    Resize {
+        pane: usize,
+        rows: u16,
+        cols: u16,
+    },
     SetLayout(Layout),
     Stop,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum SessionTarget {
+    #[default]
+    Main,
+    Existing(PathBuf),
+    Branch(String),
+    NewBranch {
+        name: String,
+        base: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionDirectories {
+    pub project: PathBuf,
+    pub worktrees: Vec<PathBuf>,
+    pub branches: Vec<LocalBranch>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LocalBranch {
+    pub name: String,
+    pub occupied: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,6 +157,9 @@ pub enum Reply {
         terminal_projects: Vec<PathBuf>,
     },
     Discovered(Vec<Repository>),
+    Directories(SessionDirectories),
+    BranchOccupied(PathBuf),
+    SessionStarted,
     Ok,
     Error(String),
 }
@@ -338,7 +384,7 @@ pub struct Repository {
     pub worktrees: Vec<PathBuf>,
 }
 
-fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
+fn git(path: &Path, args: &[impl AsRef<OsStr>]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .args(args)
         .env_remove("GIT_DIR")
@@ -365,28 +411,123 @@ fn repository(path: &Path) -> Result<Repository> {
     let top = top.strip_suffix('\r').unwrap_or(top);
     ensure!(!top.is_empty(), "Git no devolvió la raíz del repositorio");
 
-    // Git lists the main checkout first, even when invoked from a linked worktree.
-    let listing = git(Path::new(top), &["worktree", "list", "--porcelain", "-z"])?;
-    let mut paths = listing
-        .split(|byte| *byte == 0)
-        .filter_map(|field| field.strip_prefix(b"worktree "));
-    let main = paths
+    let mut checkouts = checkouts(Path::new(top))?.into_iter();
+    let (main, _) = checkouts
         .next()
         .context("Git no devolvió el directorio principal")?;
-    let root = Path::new(std::str::from_utf8(main)?).canonicalize()?;
+    let root = main.canonicalize()?;
     ensure!(
         root.join(".git").exists(),
         "Selecciona una carpeta de un repositorio Git"
     );
-    let worktrees = paths
-        .filter_map(|path| {
-            Path::new(std::str::from_utf8(path).ok()?)
-                .canonicalize()
-                .ok()
-        })
+    let worktrees = checkouts
+        .map(|(path, _)| path)
         .filter(|path| path.is_dir())
         .collect();
     Ok(Repository { root, worktrees })
+}
+
+// Git lists the main checkout first. A branch can remain registered even
+// when its directory is unavailable, so retain the original path in that case.
+fn checkouts(project: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
+    let listing = git(project, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut checkouts = Vec::new();
+    let mut path = None;
+    let mut branch = None;
+    for field in listing.split(|byte| *byte == 0) {
+        if let Some(value) = field.strip_prefix(b"worktree ") {
+            path = std::str::from_utf8(value).ok().map(PathBuf::from);
+        } else if let Some(value) = field.strip_prefix(b"branch refs/heads/") {
+            branch = std::str::from_utf8(value).ok().map(str::to_owned);
+        } else if field.is_empty() {
+            let branch = branch.take();
+            if let Some(path) = path.take() {
+                checkouts.push((path.canonicalize().unwrap_or(path), branch));
+            }
+        }
+    }
+    Ok(checkouts)
+}
+
+fn session_directories(project: &Path) -> Result<SessionDirectories> {
+    let checkouts = checkouts(project)?;
+    let worktrees = checkouts
+        .iter()
+        .skip(1)
+        .filter(|(path, _)| path.is_dir())
+        .map(|(path, _)| path.clone())
+        .collect();
+    let branches = git(
+        project,
+        &["for-each-ref", "--format=%(refname:strip=2)", "refs/heads"],
+    )?;
+    let branches = std::str::from_utf8(&branches)?
+        .lines()
+        .map(|name| LocalBranch {
+            name: name.into(),
+            occupied: occupied_checkout(&checkouts, name),
+        })
+        .collect();
+    Ok(SessionDirectories {
+        project: project.into(),
+        worktrees,
+        branches,
+    })
+}
+
+fn occupied_checkout(checkouts: &[(PathBuf, Option<String>)], name: &str) -> Option<PathBuf> {
+    checkouts
+        .iter()
+        .find(|(_, branch)| branch.as_deref() == Some(name))
+        .map(|(path, _)| path.clone())
+}
+
+fn create_worktree(project: &Path, name: &str, base: Option<&str>) -> Result<PathBuf> {
+    let parent = project
+        .parent()
+        .context("El repositorio no tiene carpeta contenedora")?;
+    let prefix = project
+        .file_name()
+        .context("El repositorio no tiene nombre")?
+        .to_string_lossy();
+    let suffix: String = name
+        .chars()
+        .take(48)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let stem = format!("{}-{}", prefix.chars().take(64).collect::<String>(), suffix);
+    let mut destination = parent.join(&stem);
+    let mut suffix = 2;
+    while destination.symlink_metadata().is_ok() {
+        destination = parent.join(format!("{stem}-{suffix}"));
+        suffix += 1;
+    }
+    let mut args = vec![
+        OsStr::new("worktree"),
+        OsStr::new("add"),
+        OsStr::new("--no-guess-remote"),
+    ];
+    let base_ref;
+    if let Some(base) = base {
+        base_ref = format!("refs/heads/{base}");
+        args.extend([
+            OsStr::new("-b"),
+            OsStr::new(name),
+            OsStr::new("--"),
+            destination.as_os_str(),
+            OsStr::new(&base_ref),
+        ]);
+    } else {
+        args.extend([OsStr::new("--"), destination.as_os_str(), OsStr::new(name)]);
+    }
+    git(project, &args)?;
+    Ok(destination.canonicalize()?)
 }
 
 fn scan_projects(container: &Path, added: &[Repository]) -> Result<Vec<Repository>> {
@@ -527,7 +668,22 @@ fn dispatch(
                 state.agent_executables.remove(&agent);
             }
         }
-        Request::StartSession { project, agent } => {
+        Request::SessionDirectories(project) => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            let added = state
+                .projects
+                .iter_mut()
+                .find(|item| item.root == project)
+                .context("Añade el repositorio primero")?;
+            let directories = session_directories(&project)?;
+            added.worktrees.clone_from(&directories.worktrees);
+            return Ok(Reply::Directories(directories));
+        }
+        Request::StartSession {
+            project,
+            agent,
+            target,
+        } => {
             let state = workspace
                 .as_mut()
                 .context("workspace action requires the desktop host")?;
@@ -536,21 +692,73 @@ fn dispatch(
                 "Añade el repositorio antes de iniciar {}",
                 agent.name()
             );
-            let detected;
-            let program = match state.agent_executables.get(&agent) {
-                Some(custom) => custom,
-                None => {
-                    detected = detect_agent(agent).with_context(|| {
-                        format!(
-                            "No se encontró {}. Elige su ejecutable desde la barra lateral.",
-                            agent.name()
-                        )
-                    })?;
-                    &detected
+            let program = state
+                .agent_executables
+                .get(&agent)
+                .cloned()
+                .or_else(|| detect_agent(agent))
+                .with_context(|| {
+                    format!(
+                        "No se encontró {}. Elige su ejecutable desde la barra lateral.",
+                        agent.name()
+                    )
+                })?;
+            let directory = match &target {
+                SessionTarget::Main => project.clone(),
+                SessionTarget::Existing(path) => {
+                    let path = path.canonicalize()?;
+                    ensure!(
+                        path == project || repository(&project)?.worktrees.contains(&path),
+                        "El directorio no pertenece a los worktrees del proyecto"
+                    );
+                    path
+                }
+                SessionTarget::Branch(name) | SessionTarget::NewBranch { name, base: _ } => {
+                    let base = match &target {
+                        SessionTarget::NewBranch { base, .. } => Some(base.as_str()),
+                        _ => None,
+                    };
+                    let directories = session_directories(&project)?;
+                    let branch = directories
+                        .branches
+                        .iter()
+                        .find(|branch| branch.name == *name);
+                    if let Some(path) = branch.and_then(|branch| branch.occupied.clone()) {
+                        return Ok(Reply::BranchOccupied(path));
+                    }
+                    if let Some(base) = base {
+                        ensure!(branch.is_none(), "La rama {name} ya existe");
+                        ensure!(
+                            directories
+                                .branches
+                                .iter()
+                                .any(|branch| branch.name == base),
+                            "La rama base {base} ya no existe"
+                        );
+                        git(
+                            &project,
+                            &["check-ref-format", &format!("refs/heads/{name}")],
+                        )?;
+                    } else {
+                        ensure!(branch.is_some(), "La rama {name} ya no existe");
+                    }
+                    let created = match create_worktree(&project, name, base) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            if let Ok(current) = checkouts(&project)
+                                && let Some(path) = occupied_checkout(&current, name)
+                            {
+                                return Ok(Reply::BranchOccupied(path));
+                            }
+                            return Err(error);
+                        }
+                    };
+                    state.add(repository(&project)?);
+                    created
                 }
             };
             let mut terminal =
-                Terminal::new(program.as_os_str(), true, &project).with_context(|| {
+                Terminal::new(program.as_os_str(), true, &directory).with_context(|| {
                     format!(
                         "No se pudo iniciar {} desde {}",
                         agent.name(),
@@ -640,6 +848,7 @@ struct Terminal {
     pid: Option<u32>,
     label: String,
     agent: Option<Agent>,
+    directory: PathBuf,
     screen: Arc<Mutex<Screen>>,
     exited: bool,
 }
@@ -710,6 +919,7 @@ impl Terminal {
             pid,
             label,
             agent: None,
+            directory: cwd.into(),
             screen,
             exited: false,
         })
@@ -792,6 +1002,7 @@ impl Terminal {
             revision: state.revision,
             label: self.label.clone(),
             agent: self.agent,
+            directory: self.directory.clone(),
             pid: self.pid,
             exited: self.exited,
             application_cursor: screen.application_cursor(),

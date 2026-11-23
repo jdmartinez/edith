@@ -13,7 +13,10 @@ use gpui::{
     WindowOptions, div, font, prelude::*, px, rgb, size, svg,
 };
 
-use crate::host::{Agent, Endpoint, Layout, PANE_COUNT, Reply, Repository, Request, Snapshot};
+use crate::host::{
+    Agent, Endpoint, Layout, PANE_COUNT, Reply, Repository, Request, SessionDirectories,
+    SessionTarget, Snapshot,
+};
 
 const HEADER_HEIGHT: f32 = 44.0;
 const STATUS_HEIGHT: f32 = 25.0;
@@ -96,6 +99,8 @@ pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {
                         terminal_projects: Vec::new(),
                         agent_executables: BTreeMap::new(),
                         choosing_agent: None,
+                        session_picker: None,
+                        branch_input: cx.focus_handle(),
                         project_dir: String::new(),
                         connected: false,
                         layout: Layout::default(),
@@ -179,8 +184,14 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
         match requests.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
             Ok(request) => {
                 let adding = matches!(request, Request::AddDiscoveredProjects(_));
+                let starting = matches!(request, Request::StartSession { .. });
                 let update = match endpoint.request(request) {
-                    Ok(reply @ Reply::Discovered(_)) => reply,
+                    Ok(
+                        reply @ (Reply::Discovered(_)
+                        | Reply::Directories(_)
+                        | Reply::BranchOccupied(_)),
+                    ) => reply,
+                    Ok(Reply::Ok) if starting => Reply::SessionStarted,
                     Ok(Reply::Ok) if adding => Reply::Ok,
                     Err(error) => Reply::Error(error.to_string()),
                     _ => continue,
@@ -208,6 +219,30 @@ enum PathAction {
     ChooseExecutable(Agent),
 }
 
+struct SessionPicker {
+    project: PathBuf,
+    agent: Agent,
+    directories: Option<SessionDirectories>,
+    pending: bool,
+    occupied: Option<PathBuf>,
+    creating: bool,
+    base: Option<String>,
+    name: String,
+}
+
+impl SessionPicker {
+    fn new_branch(&self) -> Option<SessionTarget> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        Some(SessionTarget::NewBranch {
+            name: name.to_owned(),
+            base: self.base.clone()?,
+        })
+    }
+}
+
 struct Workspace {
     focus: FocusHandle,
     active: usize,
@@ -223,6 +258,8 @@ struct Workspace {
     terminal_projects: Vec<PathBuf>,
     agent_executables: BTreeMap<Agent, PathBuf>,
     choosing_agent: Option<PathBuf>,
+    session_picker: Option<SessionPicker>,
+    branch_input: FocusHandle,
     project_dir: String,
     connected: bool,
     layout: Layout,
@@ -446,16 +483,36 @@ impl Workspace {
                             }),
                     )
                     .child(
-                        button(if self.choosing_agent.as_ref() == Some(project) {
-                            "Cancelar"
-                        } else {
-                            "+ Nueva sesión"
-                        })
+                        button(
+                            if self.choosing_agent.as_ref() == Some(project)
+                                || self
+                                    .session_picker
+                                    .as_ref()
+                                    .is_some_and(|picker| picker.project == *project)
+                            {
+                                "Cancelar"
+                            } else {
+                                "+ Nueva sesión"
+                            },
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |view, _, _, cx| {
-                                view.choosing_agent = (view.choosing_agent.as_ref() != Some(&root))
-                                    .then(|| root.clone());
+                            cx.listener(move |view, _, window, cx| {
+                                if view
+                                    .session_picker
+                                    .as_ref()
+                                    .is_some_and(|picker| picker.pending)
+                                {
+                                    return;
+                                }
+                                let already_open = view.choosing_agent.as_ref() == Some(&root)
+                                    || view
+                                        .session_picker
+                                        .as_ref()
+                                        .is_some_and(|picker| picker.project == root);
+                                view.session_picker = None;
+                                view.focus.focus(window);
+                                view.choosing_agent = (!already_open).then(|| root.clone());
                                 cx.notify();
                             }),
                         ),
@@ -467,17 +524,27 @@ impl Workspace {
                                 MouseButton::Left,
                                 cx.listener(move |view, _, _, cx| {
                                     view.choosing_agent = None;
-                                    view.send(
-                                        Request::StartSession {
-                                            project: project.clone(),
-                                            agent,
-                                        },
-                                        cx,
-                                    );
+                                    view.session_picker = Some(SessionPicker {
+                                        project: project.clone(),
+                                        agent,
+                                        directories: None,
+                                        pending: true,
+                                        occupied: None,
+                                        creating: false,
+                                        base: None,
+                                        name: String::new(),
+                                    });
+                                    view.send(Request::SessionDirectories(project.clone()), cx);
                                 }),
                             )
                         }))
                     })
+                    .when_some(
+                        self.session_picker
+                            .as_ref()
+                            .filter(|picker| picker.project == *project),
+                        |row, picker| row.child(self.directory_picker(picker, cx)),
+                    )
             }))
             .child(
                 div()
@@ -519,6 +586,178 @@ impl Workspace {
                             })
                     })),
             )
+    }
+
+    fn directory_picker(&self, picker: &SessionPicker, cx: &Context<Self>) -> Div {
+        let panel = div().mt_2().flex().flex_col().gap_1().text_size(px(12.0));
+        if picker.pending {
+            return panel.child("Consultando el repositorio…");
+        }
+        let Some(directories) = &picker.directories else {
+            return panel.child(button("Reintentar").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    if let Some(picker) = &mut view.session_picker {
+                        picker.pending = true;
+                        let project = picker.project.clone();
+                        view.send(Request::SessionDirectories(project), cx);
+                    }
+                }),
+            ));
+        };
+        if let Some(path) = &picker.occupied {
+            return panel
+                .child("Rama ocupada en")
+                .child(path.display().to_string())
+                .when(path.is_dir(), |panel| {
+                    panel.child(self.directory_button(
+                        "Abrir sesión aquí",
+                        SessionTarget::Existing(path.clone()),
+                        cx,
+                    ))
+                })
+                .child(self.new_branch_button(cx))
+                .child(button("Elegir otra rama").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _, _, cx| {
+                        if let Some(picker) = &mut view.session_picker {
+                            picker.occupied = None;
+                            picker.creating = false;
+                            cx.notify();
+                        }
+                    }),
+                ));
+        }
+        if picker.creating {
+            let name = if picker.name.is_empty() {
+                "Nombre de la rama"
+            } else {
+                &picker.name
+            };
+            return panel
+                .child(
+                    div()
+                        .track_focus(&self.branch_input)
+                        .px_2()
+                        .py_1()
+                        .border_1()
+                        .border_color(rgb(0x536987))
+                        .focus(|style| style.border_color(rgb(0x8ab4ed)))
+                        .rounded_md()
+                        .cursor(CursorStyle::IBeam)
+                        .child(name.to_owned())
+                        .on_key_down(cx.listener(Self::edit_branch_name))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, window, cx| {
+                                view.branch_input.focus(window);
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child("Rama base")
+                .children(directories.branches.iter().map(|branch| {
+                    let name = branch.name.clone();
+                    let selected = picker.base.as_ref() == Some(&name);
+                    button(format!("{}{}", if selected { "✓ " } else { "" }, name)).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            if let Some(picker) = &mut view.session_picker {
+                                picker.base = Some(name.clone());
+                                cx.notify();
+                            }
+                        }),
+                    )
+                }))
+                .when_some(picker.new_branch(), |panel, target| {
+                    panel.child(self.directory_button("Crear y abrir sesión", target, cx))
+                })
+                .child(button("Volver a los directorios").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _, window, cx| {
+                        if let Some(picker) = &mut view.session_picker {
+                            picker.creating = false;
+                            view.focus.focus(window);
+                            cx.notify();
+                        }
+                    }),
+                ));
+        }
+        panel
+            .child(format!("Directorio de la sesión · {}", picker.agent.name()))
+            .child(self.directory_button("Directorio principal", SessionTarget::Main, cx))
+            .children(directories.worktrees.iter().map(|path| {
+                self.directory_button(
+                    format!("Worktree · {}", project_name(path)),
+                    SessionTarget::Existing(path.clone()),
+                    cx,
+                )
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(11.0))
+                        .child(path.display().to_string()),
+                )
+            }))
+            .when(!directories.branches.is_empty(), |panel| {
+                panel
+                    .child(self.new_branch_button(cx))
+                    .child("Crear worktree con una rama local")
+                    .children(directories.branches.iter().map(|branch| {
+                        self.directory_button(
+                            if branch.occupied.is_some() {
+                                format!("{} · Ocupada", branch.name)
+                            } else {
+                                branch.name.clone()
+                            },
+                            SessionTarget::Branch(branch.name.clone()),
+                            cx,
+                        )
+                    }))
+            })
+    }
+
+    fn directory_button(
+        &self,
+        label: impl Into<SharedString>,
+        target: SessionTarget,
+        cx: &Context<Self>,
+    ) -> Div {
+        button(label).whitespace_normal().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, _, window, cx| {
+                view.focus.focus(window);
+                view.start_session(target.clone(), cx);
+            }),
+        )
+    }
+
+    fn new_branch_button(&self, cx: &Context<Self>) -> Div {
+        button("Crear rama nueva").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|view, _, window, cx| {
+                if let Some(picker) = &mut view.session_picker {
+                    picker.occupied = None;
+                    picker.creating = true;
+                    view.branch_input.focus(window);
+                    cx.notify();
+                }
+            }),
+        )
+    }
+
+    fn start_session(&mut self, target: SessionTarget, cx: &mut Context<Self>) {
+        if let Some(picker) = &mut self.session_picker
+            && !picker.pending
+        {
+            picker.pending = true;
+            let request = Request::StartSession {
+                project: picker.project.clone(),
+                agent: picker.agent,
+                target,
+            };
+            self.send(request, cx);
+        }
     }
 
     fn discovery_panel(&self, candidates: &[Repository], cx: &Context<Self>) -> Div {
@@ -646,7 +885,27 @@ impl Workspace {
                         }
                     }
                 }
-                Ok(Reply::Error(error)) => self.status = format!("Host: {error}").into(),
+                Ok(Reply::Directories(directories)) => {
+                    if let Some(picker) = &mut self.session_picker
+                        && picker.project == directories.project
+                    {
+                        picker.directories = Some(directories);
+                        picker.pending = false;
+                    }
+                }
+                Ok(Reply::BranchOccupied(path)) => {
+                    if let Some(picker) = &mut self.session_picker {
+                        picker.occupied = Some(path);
+                        picker.pending = false;
+                    }
+                }
+                Ok(Reply::SessionStarted) => self.session_picker = None,
+                Ok(Reply::Error(error)) => {
+                    if let Some(picker) = &mut self.session_picker {
+                        picker.pending = false;
+                    }
+                    self.status = format!("Host: {error}").into();
+                }
                 Ok(Reply::Discovered(candidates)) => {
                     self.discovery = Some(candidates);
                     self.selected_projects.clear();
@@ -966,12 +1225,16 @@ impl Workspace {
                     .px(px(PADDING))
                     .bg(rgb(if focused { 0x263b53 } else { 0x1c2431 }))
                     .text_size(px(12.0))
-                    .child(if self.desktop {
-                        self.terminal_projects[index].display().to_string()
+                    .child(div().min_w_0().truncate().child(if self.desktop {
+                        if snapshot.directory.as_os_str().is_empty() {
+                            self.terminal_projects[index].display().to_string()
+                        } else {
+                            snapshot.directory.display().to_string()
+                        }
                     } else {
                         format!("{}  {label}", index + 1)
-                    })
-                    .child(div().text_color(rgb(0xaab8cc)).child(status)),
+                    }))
+                    .child(div().flex_none().text_color(rgb(0xaab8cc)).child(status)),
             )
             .child(
                 div()
@@ -1007,6 +1270,43 @@ impl Workspace {
                             }))
                     })),
             )
+    }
+
+    fn edit_branch_name(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(picker) = &mut self.session_picker {
+            let key = &event.keystroke;
+            match key.key.as_str() {
+                "backspace" => {
+                    picker.name.pop();
+                }
+                "enter" => {
+                    if let Some(target) = picker.new_branch() {
+                        self.focus.focus(window);
+                        self.start_session(target, cx);
+                    }
+                }
+                "escape" => self.focus.focus(window),
+                "v" if key.modifiers.platform || key.modifiers.control => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        picker.name.push_str(text.trim());
+                    }
+                }
+                _ if !key.modifiers.platform && !key.modifiers.control => {
+                    if let Some(text) = &key.key_char {
+                        picker.name.push_str(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
