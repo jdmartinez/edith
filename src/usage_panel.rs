@@ -67,6 +67,7 @@ pub(crate) fn agent_name(agent: UsageAgent) -> &'static str {
 
 enum Update {
     Saved(Vec<UsageEvent>),
+    Erased(History),
     Finished { history: History, incomplete: bool },
 }
 
@@ -78,6 +79,8 @@ pub struct UsagePanel {
     pub(crate) filters: Filters,
     message: &'static str,
     billing_report: Option<BillingReport>,
+    erasing: bool,
+    pub(crate) erase_selection: Option<Option<UsageAgent>>,
     billing_error: bool,
     billing_updates: Option<Receiver<Result<BillingReport>>>,
 }
@@ -121,11 +124,41 @@ impl UsagePanel {
         });
     }
 
+    pub(crate) fn erase(&mut self, agent: Option<UsageAgent>) {
+        if self.scanning() {
+            return;
+        }
+        self.erase_selection = None;
+        self.erasing = true;
+        self.message = "";
+        let (send, receive) = mpsc::channel();
+        self.updates = Some(receive);
+        thread::spawn(move || {
+            let result = (|| {
+                let store = UsageStore::new(usage_database()?);
+                store.erase(agent)?;
+                store.saved()
+            })();
+            let _ = send.send(Update::Erased(result));
+        });
+    }
+
     pub fn refresh(&mut self) -> bool {
         let mut changed = self.refresh_billing();
         while let Some(updates) = &self.updates {
             match updates.try_recv() {
                 Ok(Update::Saved(events)) => self.events = events,
+                Ok(Update::Erased(result)) => {
+                    self.message = match result {
+                        Ok(events) => {
+                            self.events = events;
+                            "Historial local borrado."
+                        }
+                        Err(_) => "No se pudo completar el borrado. Puedes reintentarlo.",
+                    };
+                    self.erasing = false;
+                    self.updates = None;
+                }
                 Ok(Update::Finished {
                     history,
                     incomplete,
@@ -145,7 +178,8 @@ impl UsagePanel {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.message = "El escaneo se interrumpió. Puedes reintentarlo.";
+                    self.message = "La operación se interrumpió. Puedes reintentarlo.";
+                    self.erasing = false;
                     self.updates = None;
                 }
             }
@@ -168,7 +202,9 @@ impl UsagePanel {
     }
 
     pub fn status(&self) -> &'static str {
-        if self.scanning() {
+        if self.erasing {
+            "Borrando historial local…"
+        } else if self.scanning() {
             "Escaneando historial local…"
         } else {
             self.message

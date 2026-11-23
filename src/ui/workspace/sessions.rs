@@ -113,6 +113,9 @@ impl Workspace {
                 MouseButton::Left,
                 cx.listener(|view, _, _, cx| view.choose_path(PathAction::ScanProjects, cx)),
             ))
+            .when(self.connected, |sidebar| {
+                sidebar.child(self.session_retention_controls(cx))
+            })
             .when_some(self.sessions.discovery.as_ref(), |sidebar, candidates| {
                 sidebar.child(self.discovery_panel(candidates, cx))
             })

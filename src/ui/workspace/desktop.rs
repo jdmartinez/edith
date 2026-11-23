@@ -108,21 +108,25 @@ impl Workspace {
                             .items_center()
                             .gap(px(4.0))
                             .overflow_x_scroll()
-                            .children(self.terminal_projects.iter().enumerate().map(
-                                |(index, project)| {
-                                    self.session_button(
-                                        index,
-                                        format!(
-                                            "{} · {} {}",
-                                            project_name(project),
-                                            self.session_agent(index).name(),
-                                            index + 1
-                                        ),
-                                        cx,
-                                    )
-                                    .flex_none()
-                                },
-                            )),
+                            .children(
+                                self.terminal_projects
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, project)| !project.as_os_str().is_empty())
+                                    .map(|(index, project)| {
+                                        self.session_button(
+                                            index,
+                                            format!(
+                                                "{} · {} {}",
+                                                project_name(project),
+                                                self.session_agent(index).name(),
+                                                index + 1
+                                            ),
+                                            cx,
+                                        )
+                                        .flex_none()
+                                    }),
+                            ),
                     ),
             )
             .when(show_status, |root| {

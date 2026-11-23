@@ -183,6 +183,12 @@ impl Endpoint {
             let reply = request
                 .and_then(|request| {
                     let save = WorkspaceStore::saves_request(&request);
+                    if matches!(request, Request::Poll(_))
+                        && let Some((store, workspace)) = desktop_state.as_mut()
+                        && store.expire_closed(workspace, &mut terminals)?
+                    {
+                        store.save(workspace, &mut terminals)?;
+                    }
                     let reply = dispatch(
                         &mut terminals,
                         &mut layout,
