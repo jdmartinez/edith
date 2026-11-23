@@ -10,12 +10,13 @@ use anyhow::{Context, Result};
 use chrono::DateTime;
 use gpui::{Div, div, prelude::*, px, rgb};
 
-use crate::usage::{UsageEvent, UsageStore};
+use crate::usage::{UsageAgent, UsageEvent, UsageStore};
 
-type History = Result<Summary>;
+type Summaries = BTreeMap<UsageAgent, Summary>;
+type History = Result<Summaries>;
 
 enum Update {
-    Saved(Summary),
+    Saved(Summaries),
     Finished { history: History, incomplete: bool },
 }
 
@@ -23,7 +24,7 @@ enum Update {
 pub struct UsagePanel {
     pub open: bool,
     updates: Option<Receiver<Update>>,
-    summary: Summary,
+    summaries: Summaries,
     message: &'static str,
 }
 
@@ -43,22 +44,22 @@ impl UsagePanel {
             let store = usage_database().map(UsageStore::new);
             let Ok(store) = store else {
                 let _ = send.send(Update::Finished {
-                    history: store.map(|_| Summary::default()),
+                    history: store.map(|_| Summaries::default()),
                     incomplete: true,
                 });
                 return;
             };
             if let Ok(events) = store.saved() {
-                if send
-                    .send(Update::Saved(Summary::from_events(events)))
-                    .is_err()
-                {
+                if send.send(Update::Saved(summarize(events))).is_err() {
                     return;
                 }
             }
-            let incomplete = codex_home().and_then(|home| store.scan(&home)).is_err();
+            let codex = agent_home("CODEX_HOME", ".codex").and_then(|home| store.scan(&home));
+            let claude = agent_home("CLAUDE_CONFIG_DIR", ".claude")
+                .and_then(|home| store.scan_claude(&home));
+            let incomplete = codex.is_err() || claude.is_err();
             let _ = send.send(Update::Finished {
-                history: store.saved().map(Summary::from_events),
+                history: store.saved().map(summarize),
                 incomplete,
             });
         });
@@ -68,14 +69,14 @@ impl UsagePanel {
         let mut changed = false;
         while let Some(updates) = &self.updates {
             match updates.try_recv() {
-                Ok(Update::Saved(summary)) => self.summary = summary,
+                Ok(Update::Saved(summary)) => self.summaries = summary,
                 Ok(Update::Finished {
                     history,
                     incomplete,
                 }) => {
                     self.message = match history {
                         Ok(history) => {
-                            self.summary = history;
+                            self.summaries = history;
                             if incomplete {
                                 "El escaneo quedó incompleto. Puedes reintentarlo."
                             } else {
@@ -106,26 +107,47 @@ impl UsagePanel {
     }
 
     pub fn content(&self) -> Div {
-        if self.summary.days.is_empty() {
+        if self.summaries.is_empty() {
             return div()
                 .p_6()
                 .text_color(rgb(0xaab8cc))
                 .child(if self.scanning() {
-                    "Buscando métricas de Codex…"
+                    "Buscando métricas locales…"
                 } else {
-                    "Todavía no hay métricas de Codex guardadas."
+                    "Todavía no hay métricas guardadas."
                 });
         }
-        let Summary {
+        div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .p_6()
+            .children(self.summaries.iter().map(|(agent, summary)| {
+                let name = match agent {
+                    UsageAgent::Codex => "Codex",
+                    UsageAgent::Claude => "Claude Code",
+                };
+                summary.content(name)
+            }))
+    }
+}
+
+impl Summary {
+    fn content(&self, name: &'static str) -> Div {
+        let Self {
             total,
             days,
             models,
-        } = &self.summary;
+        } = self;
+        let mut models = models.iter().collect::<Vec<_>>();
+        models.sort_by(|(a, first), (b, second)| {
+            second.input.cmp(&first.input).then_with(|| a.cmp(b))
+        });
         div()
             .flex()
             .flex_col()
             .gap_4()
-            .p_6()
+            .child(div().text_xl().child(name))
             .child(
                 div()
                     .flex()
@@ -137,7 +159,7 @@ impl UsagePanel {
             .child(daily_chart(days))
             .child(
                 card()
-                    .child(div().text_lg().child("Modelos de Codex"))
+                    .child(div().text_lg().child("Modelos"))
                     .child(
                         model_row("Modelo", "Entrada".into(), "Salida".into())
                             .text_color(rgb(0xaab8cc)),
@@ -160,41 +182,39 @@ fn usage_database() -> Result<PathBuf> {
     Ok(directory.join("usage.sqlite"))
 }
 
-fn codex_home() -> Result<PathBuf> {
-    if let Some(home) = env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+fn agent_home(variable: &str, default: &str) -> Result<PathBuf> {
+    if let Some(home) = env::var_os(variable).filter(|value| !value.is_empty()) {
         return Ok(env::current_dir()?.join(home));
     }
     Ok(dirs::home_dir()
         .context("missing home directory")?
-        .join(".codex"))
+        .join(default))
 }
 
 #[derive(Default)]
 struct Summary {
     total: Totals,
     days: BTreeMap<i64, Totals>,
-    models: Vec<(String, Totals)>,
+    models: BTreeMap<String, Totals>,
 }
 
-impl Summary {
-    fn from_events(events: Vec<UsageEvent>) -> Self {
-        let mut summary = Self::default();
-        let mut models = BTreeMap::<String, Totals>::new();
-        for event in events {
-            summary.total.add(&event);
-            summary
-                .days
-                .entry(event.timestamp.div_euclid(86_400))
-                .or_default()
-                .add(&event);
-            models.entry(event.model.clone()).or_default().add(&event);
-        }
-        summary.models = models.into_iter().collect();
-        summary.models.sort_by(|(a, first), (b, second)| {
-            second.input.cmp(&first.input).then_with(|| a.cmp(b))
-        });
+fn summarize(events: Vec<UsageEvent>) -> Summaries {
+    let mut summaries = Summaries::new();
+    for event in events {
+        let summary = summaries.entry(event.agent).or_default();
+        summary.total.add(&event);
         summary
+            .days
+            .entry(event.timestamp.div_euclid(86_400))
+            .or_default()
+            .add(&event);
+        summary
+            .models
+            .entry(event.model.clone())
+            .or_default()
+            .add(&event);
     }
+    summaries
 }
 
 #[derive(Default)]
