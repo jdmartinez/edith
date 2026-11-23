@@ -19,6 +19,7 @@ use crate::host::{
 };
 
 use crate::panels::{Axis, DesktopLayout, Panel, PanelAction};
+use crate::usage_panel::UsagePanel;
 
 const HEADER_HEIGHT: f32 = 44.0;
 const STATUS_HEIGHT: f32 = 25.0;
@@ -94,6 +95,7 @@ pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {
                         panes: Vec::new(),
                         desktop,
                         sidebar_visible: true,
+                        usage: UsagePanel::default(),
                         projects: Vec::new(),
                         worktrees: BTreeMap::new(),
                         discovery: None,
@@ -305,6 +307,7 @@ struct Workspace {
     panes: Vec<Snapshot>,
     desktop: bool,
     sidebar_visible: bool,
+    usage: UsagePanel,
     projects: Vec<PathBuf>,
     worktrees: BTreeMap<PathBuf, Vec<PathBuf>>,
     discovery: Option<Vec<Repository>>,
@@ -330,6 +333,70 @@ struct Workspace {
 }
 
 impl Workspace {
+    fn usage_view(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x11151d))
+            .text_color(rgb(0xd9e0ee))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    view.usage.open = false;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(0x171d28))
+                    .border_b_1()
+                    .border_color(rgb(0x2a3344))
+                    .child(button("Volver").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            view.usage.open = false;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(div().text_lg().child("Historial de Codex"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(rgb(0xaab8cc))
+                            .child(self.usage.status()),
+                    )
+                    .child(if self.usage.scanning() {
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xaab8cc))
+                            .child("Actualizando…")
+                    } else {
+                        button("Actualizar").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| {
+                                view.usage.scan();
+                                cx.notify();
+                            }),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("codex-usage-history")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.usage.content()),
+            )
+    }
+
     fn desktop(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let bounds = window.viewport_size();
         let sidebar_width = if self.sidebar_visible {
@@ -381,6 +448,20 @@ impl Workspace {
                                 }),
                             ),
                         ),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .flex_none()
+                            .child(button("Estadísticas").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, window, cx| {
+                                    view.usage.open = true;
+                                    view.usage.scan();
+                                    view.focus.focus(window);
+                                    cx.notify();
+                                }),
+                            )),
                     )
                     .child(
                         div()
@@ -1170,7 +1251,7 @@ impl Workspace {
     }
 
     fn refresh(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.usage.refresh();
         for update in self.updates.try_iter() {
             changed = true;
             match update {
@@ -1769,6 +1850,9 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds = window.viewport_size();
+        if self.usage.open {
+            return self.usage_view(cx).into_any_element();
+        }
         if self.desktop {
             return self.desktop(window, cx).into_any_element();
         }

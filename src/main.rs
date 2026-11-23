@@ -2,6 +2,10 @@ mod host;
 mod panels;
 #[cfg(feature = "ui")]
 mod ui;
+#[cfg(feature = "ui")]
+mod usage;
+#[cfg(feature = "ui")]
+mod usage_panel;
 
 use std::env;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
