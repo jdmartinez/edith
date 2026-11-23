@@ -6,7 +6,7 @@ Edith abre sesiones de Codex para repositorios locales y las mantiene activas al
 cargo run --locked
 ```
 
-1. Pulsa **Añadir repositorio** y selecciona una carpeta del repositorio principal.
+1. Pulsa **Añadir repositorio** y selecciona una carpeta dentro del repositorio. Para añadir varios proyectos, pulsa **Escanear carpeta…**, elige la carpeta contenedora, marca los clones que quieras ver y pulsa **Añadir seleccionados**. Cada clon local tiene su propio proyecto y muestra sus worktrees debajo.
 2. Pulsa **Iniciar Codex** en el proyecto. Edith detecta Codex en `PATH`. Usa **Elegir ejecutable** para dar prioridad a otra instalación. Codex hereda la configuración y el entorno del usuario.
 3. Selecciona una sesión desde la barra lateral o su pestaña para enviarle el teclado. El control en la cabecera permite ocultar y volver a mostrar la barra lateral.
 4. Cierra y vuelve a abrir la ventana para recuperar las sesiones, incluidos el estado y la última pantalla disponible de las que terminaron.

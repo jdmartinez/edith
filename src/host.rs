@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -57,6 +58,8 @@ pub enum Request {
     Poll(Vec<u64>),
     DesktopReady,
     AddProject(PathBuf),
+    ScanProjects(PathBuf),
+    AddDiscoveredProjects(Vec<PathBuf>),
     SetCodex(Option<PathBuf>),
     StartCodex(PathBuf),
     Input { pane: usize, bytes: Vec<u8> },
@@ -75,10 +78,13 @@ pub enum Reply {
         #[serde(default)]
         projects: Vec<PathBuf>,
         #[serde(default)]
+        worktrees: BTreeMap<PathBuf, Vec<PathBuf>>,
+        #[serde(default)]
         codex: Option<PathBuf>,
         #[serde(default)]
         terminal_projects: Vec<PathBuf>,
     },
+    Discovered(Vec<Repository>),
     Ok,
     Error(String),
 }
@@ -292,34 +298,107 @@ fn read_message<T: serde::de::DeserializeOwned>(reader: impl BufRead, limit: u64
 
 #[derive(Default)]
 struct WorkspaceState {
-    projects: Vec<PathBuf>,
+    projects: Vec<Repository>,
     codex: Option<PathBuf>,
     terminal_projects: Vec<PathBuf>,
 }
 
-fn repository_root(path: &Path) -> Result<PathBuf> {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Repository {
+    pub root: PathBuf,
+    pub worktrees: Vec<PathBuf>,
+}
+
+fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
         .current_dir(path)
         .output()
         .context("No se pudo ejecutar Git")?;
     ensure!(
         output.status.success(),
+        "Git en {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+fn repository(path: &Path) -> Result<Repository> {
+    let top = git(path, &["rev-parse", "--show-toplevel"])?;
+    let top = std::str::from_utf8(&top)?
+        .strip_suffix('\n')
+        .unwrap_or_default();
+    #[cfg(windows)]
+    let top = top.strip_suffix('\r').unwrap_or(top);
+    ensure!(!top.is_empty(), "Git no devolvió la raíz del repositorio");
+
+    // Git lists the main checkout first, even when invoked from a linked worktree.
+    let listing = git(Path::new(top), &["worktree", "list", "--porcelain", "-z"])?;
+    let mut paths = listing
+        .split(|byte| *byte == 0)
+        .filter_map(|field| field.strip_prefix(b"worktree "));
+    let main = paths
+        .next()
+        .context("Git no devolvió el directorio principal")?;
+    let root = Path::new(std::str::from_utf8(main)?).canonicalize()?;
+    ensure!(
+        root.join(".git").exists(),
         "Selecciona una carpeta de un repositorio Git"
     );
-    let root = std::str::from_utf8(&output.stdout)?
-        .strip_suffix('\n')
-        .unwrap_or_default()
-        .trim_end_matches('\r');
-    let root = PathBuf::from(root);
-    #[cfg(unix)]
-    let root = root.canonicalize()?;
-    ensure!(root.is_absolute(), "Git no devolvió un directorio absoluto");
-    ensure!(
-        root.join(".git").is_dir(),
-        "Selecciona el directorio principal del repositorio"
-    );
-    Ok(root)
+    let worktrees = paths
+        .filter_map(|path| {
+            Path::new(std::str::from_utf8(path).ok()?)
+                .canonicalize()
+                .ok()
+        })
+        .filter(|path| path.is_dir())
+        .collect();
+    Ok(Repository { root, worktrees })
+}
+
+fn scan_projects(container: &Path, added: &[Repository]) -> Result<Vec<Repository>> {
+    let mut found = BTreeMap::new();
+    let mut pending = vec![container.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if path == container => {
+                return Err(error).with_context(|| format!("No se pudo abrir {}", path.display()));
+            }
+            Err(_) => continue,
+        };
+        if path.join(".git").exists()
+            && let Ok(project) = repository(&path)
+        {
+            found.insert(project.root.clone(), project);
+        }
+        pending.extend(entries.flatten().filter_map(|entry| {
+            (entry.file_name() != ".git" && entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .then(|| entry.path())
+        }));
+    }
+    for project in added {
+        found.remove(&project.root);
+    }
+    Ok(found.into_values().collect())
+}
+
+impl WorkspaceState {
+    fn add(&mut self, project: Repository) {
+        if let Some(existing) = self
+            .projects
+            .iter_mut()
+            .find(|item| item.root == project.root)
+        {
+            *existing = project;
+        } else {
+            self.projects.push(project);
+        }
+    }
 }
 
 fn dispatch(
@@ -343,9 +422,20 @@ fn dispatch(
                 layout: *layout,
                 project_dir: project_dir.into(),
                 panes,
-                projects: workspace
-                    .as_ref()
-                    .map_or_else(Vec::new, |state| state.projects.clone()),
+                projects: workspace.as_ref().map_or_else(Vec::new, |state| {
+                    state
+                        .projects
+                        .iter()
+                        .map(|project| project.root.clone())
+                        .collect()
+                }),
+                worktrees: workspace.as_ref().map_or_else(BTreeMap::new, |state| {
+                    state
+                        .projects
+                        .iter()
+                        .map(|project| (project.root.clone(), project.worktrees.clone()))
+                        .collect()
+                }),
                 codex: workspace.as_ref().and_then(|state| state.codex.clone()),
                 terminal_projects: workspace
                     .as_ref()
@@ -374,9 +464,21 @@ fn dispatch(
             let state = workspace
                 .as_mut()
                 .context("workspace action requires the desktop host")?;
-            let root = repository_root(&path)?;
-            if !state.projects.contains(&root) {
-                state.projects.push(root);
+            state.add(repository(&path)?);
+        }
+        Request::ScanProjects(path) => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            return Ok(Reply::Discovered(scan_projects(&path, &state.projects)?));
+        }
+        Request::AddDiscoveredProjects(paths) => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            // Resolve all selections before updating the workspace.
+            let projects = paths
+                .iter()
+                .map(|path| repository(path))
+                .collect::<Result<Vec<_>>>()?;
+            for project in projects {
+                state.add(project);
             }
         }
         Request::SetCodex(path) => {
@@ -396,7 +498,7 @@ fn dispatch(
                 .as_mut()
                 .context("workspace action requires the desktop host")?;
             ensure!(
-                state.projects.contains(&project),
+                state.projects.iter().any(|item| item.root == project),
                 "Añade el repositorio antes de iniciar Codex"
             );
             let detected;
