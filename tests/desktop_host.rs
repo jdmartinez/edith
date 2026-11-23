@@ -530,3 +530,150 @@ fn closing_a_panel_stops_its_terminal_and_keeps_the_other_panel_assigned() {
     assert_eq!(after["State"]["panes"][0]["exited"], false);
     assert!(host.request(json!({"Input":{"pane":1,"bytes":b"closed\r"}}))["Error"].is_string());
 }
+
+#[test]
+fn worktree_removal_requires_review_and_keeps_unintegrated_branch() {
+    let host = start_host();
+    let repo = host.state.join("project");
+    let tree = host.state.join("linked tree");
+    fs::create_dir(&repo).unwrap();
+    let git = |directory: &std::path::Path, arguments: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(directory)
+            .args([
+                "-c",
+                "user.name=Edith",
+                "-c",
+                "user.email=edith@example.com",
+            ])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&repo, &["init", "-qb", "main"]);
+    fs::write(repo.join("tracked"), "base").unwrap();
+    git(&repo, &["add", "tracked"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    git(
+        &repo,
+        &["worktree", "add", "-qb", "feature", tree.to_str().unwrap()],
+    );
+    git(&tree, &["commit", "-qm", "pending", "--allow-empty"]);
+    // Git's upstream check alone would permit deletion of this branch.
+    git(&tree, &["branch", "upstream"]);
+    git(&tree, &["branch", "--set-upstream-to=upstream", "feature"]);
+    let repo = repo.canonicalize().unwrap();
+    let tree = tree.canonicalize().unwrap();
+    assert_eq!(host.request(json!({"AddProject": repo})), "Ok");
+
+    let inspect = |path: &std::path::Path| {
+        host.request(json!({"InspectWorktreeRemoval":{"project":repo,"path":path}}))
+    };
+    let remove = |force, delete_branch| {
+        host.request(json!({"RemoveWorktree":{"project":repo,"path":tree,"force":force,"delete_branch":delete_branch}}))
+    };
+    assert!(inspect(&repo).get("Error").is_some());
+    assert!(remove(true, true).get("Error").is_some());
+    fs::write(tree.join("tracked"), "modified").unwrap();
+    fs::write(tree.join("untracked"), "local").unwrap();
+    let preview = inspect(&tree);
+    assert_eq!(
+        preview["WorktreeRemoval"]["changes"],
+        json!([" M tracked", "?? untracked"]),
+        "{preview}"
+    );
+    assert!(remove(false, true).get("WorktreeRemoval").is_some());
+    fs::write(tree.join("new file"), "created after review").unwrap();
+    assert!(remove(true, true).get("WorktreeRemoval").is_some());
+    assert!(tree.is_dir());
+    let removed = remove(true, true);
+    assert_eq!(
+        removed["WorktreeRemoved"]["retained_branch"], "feature",
+        "{removed}"
+    );
+    assert!(!tree.exists());
+    git(&repo, &["show-ref", "--verify", "refs/heads/feature"]);
+    assert_eq!(fs::read_to_string(repo.join("tracked")).unwrap(), "base");
+    assert_eq!(
+        host.request(json!({"Poll": []}))["State"]["worktrees"][repo.to_str().unwrap()],
+        json!([])
+    );
+}
+
+#[test]
+fn worktree_removal_rechecks_hidden_sessions_and_allows_branch_choice() {
+    let (host, repo) = panel_host();
+    let tree = host.state.join("linked");
+    let git = |arguments: &[&str]| {
+        Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "user.name=Edith",
+                "-c",
+                "user.email=edith@example.com",
+            ])
+            .args(arguments)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(git(&["commit", "-qm", "base", "--allow-empty"]));
+    assert!(git(&[
+        "worktree",
+        "add",
+        "-qb",
+        "keep",
+        tree.to_str().unwrap()
+    ]));
+    let tree = tree.canonicalize().unwrap();
+    let inspect = || host.request(json!({"InspectWorktreeRemoval":{"project":repo,"path":tree}}));
+    let remove = |delete_branch| {
+        host.request(
+        json!({"RemoveWorktree":{"project":repo,"path":tree,"force":false,"delete_branch":delete_branch}}),
+    )
+    };
+    assert_eq!(inspect()["WorktreeRemoval"]["active_sessions"], json!([]));
+    open_panel(&host, &repo);
+    panel_action(&host, json!({"Split":{"pane":0,"axis":"Columns"}}));
+    assert_eq!(
+        host.request(
+            json!({"StartSession":{"project":repo,"agent":"Codex","target":{"Existing":tree}}})
+        ),
+        "Ok"
+    );
+    panel_action(&host, json!({"Hide":{"pane":1}}));
+    assert_eq!(
+        remove(false)["WorktreeRemoval"]["active_sessions"],
+        json!([1])
+    );
+    assert!(tree.exists());
+    panel_action(&host, json!({"Show":{"pane":1}}));
+    panel_action(&host, json!({"Close":{"pane":1}}));
+    assert_eq!(inspect()["WorktreeRemoval"]["active_sessions"], json!([]));
+    assert_eq!(
+        remove(false),
+        json!({"WorktreeRemoved":{"retained_branch":null}})
+    );
+    assert!(git(&["show-ref", "--verify", "refs/heads/keep"]));
+
+    assert!(git(&[
+        "worktree",
+        "add",
+        "-qb",
+        "delete",
+        tree.to_str().unwrap()
+    ]));
+    assert_eq!(inspect()["WorktreeRemoval"]["branch"], "delete");
+    assert_eq!(
+        remove(true),
+        json!({"WorktreeRemoved":{"retained_branch":null}})
+    );
+    assert!(!git(&["show-ref", "--verify", "refs/heads/delete"]));
+    assert_eq!(
+        host.request(json!({"Poll": []}))["State"]["panes"][0]["exited"],
+        false
+    );
+}

@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::host::{
     Agent, Endpoint, Layout, PANE_COUNT, Reply, Repository, Request, SessionDirectories,
-    SessionTarget, Snapshot,
+    SessionTarget, Snapshot, WorktreeRemoval,
 };
 
 use crate::panels::{Axis, DesktopLayout, Panel, PanelAction};
@@ -102,6 +102,7 @@ pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {
                         agent_executables: BTreeMap::new(),
                         choosing_agent: None,
                         session_picker: None,
+                        worktree_removal: None,
                         branch_input: cx.focus_handle(),
                         project_dir: String::new(),
                         connected: false,
@@ -203,7 +204,9 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                     Ok(
                         reply @ (Reply::Discovered(_)
                         | Reply::Directories(_)
-                        | Reply::BranchOccupied(_)),
+                        | Reply::BranchOccupied(_)
+                        | Reply::WorktreeRemoval(_)
+                        | Reply::WorktreeRemoved { .. }),
                     ) => reply,
                     Ok(Reply::Ok) if starting => Reply::SessionStarted,
                     Ok(Reply::Ok) if adding => Reply::Ok,
@@ -310,6 +313,7 @@ struct Workspace {
     agent_executables: BTreeMap<Agent, PathBuf>,
     choosing_agent: Option<PathBuf>,
     session_picker: Option<SessionPicker>,
+    worktree_removal: Option<WorktreeRemoval>,
     branch_input: FocusHandle,
     project_dir: String,
     connected: bool,
@@ -648,6 +652,31 @@ impl Workspace {
                                     .text_color(rgb(0xaeb8c9))
                                     .child(format!("Worktree · {}", project_name(path)))
                                     .child(div().child(path.display().to_string()))
+                                    .child(button("Retirar worktree…").mt_1().on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener({
+                                            let project = project.clone();
+                                            let path = path.clone();
+                                            move |view, _, _, cx| {
+                                                view.worktree_removal = None;
+                                                view.send(
+                                                    Request::InspectWorktreeRemoval {
+                                                        project: project.clone(),
+                                                        path: path.clone(),
+                                                    },
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                    ))
+                                    .when_some(
+                                        self.worktree_removal.as_ref().filter(|preview| {
+                                            preview.project == *project && preview.path == *path
+                                        }),
+                                        |row, preview| {
+                                            row.child(self.worktree_removal_panel(preview, cx))
+                                        },
+                                    )
                             }),
                     )
                     .children(
@@ -791,6 +820,93 @@ impl Workspace {
                                 ))
                             })
                     })),
+            )
+    }
+
+    fn worktree_removal_panel(&self, preview: &WorktreeRemoval, cx: &Context<Self>) -> Div {
+        let panel = div().mt_2().flex().flex_col().gap_1().child(
+            button("Cancelar retirada").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    view.worktree_removal = None;
+                    cx.notify();
+                }),
+            ),
+        );
+        if !preview.active_sessions.is_empty() {
+            return panel
+                .child("Abre y cierra estas sesiones antes de retirar el worktree:")
+                .children(preview.active_sessions.iter().map(|&index| {
+                    self.session_button(index, format!("Mostrar sesión {}", index + 1), cx)
+                }))
+                .child(button("Volver a comprobar").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener({
+                        let project = preview.project.clone();
+                        let path = preview.path.clone();
+                        move |view, _, _, cx| {
+                            view.send(
+                                Request::InspectWorktreeRemoval {
+                                    project: project.clone(),
+                                    path: path.clone(),
+                                },
+                                cx,
+                            );
+                        }
+                    }),
+                ));
+        }
+
+        let force = !preview.changes.is_empty();
+        panel
+            .when(force, |panel| {
+                panel
+                    .child("La retirada forzada puede descartar estos cambios y archivos:")
+                    .children(
+                        preview
+                            .changes
+                            .iter()
+                            .map(|change| div().child(change.clone())),
+                    )
+            })
+            .when_some(preview.branch.as_ref(), |panel, branch| {
+                panel
+                    .child(format!("Rama local: {branch}"))
+                    .child("Git conservará la rama si tiene commits pendientes de integrar.")
+            })
+            .children(
+                [false, true]
+                    .into_iter()
+                    .filter(|delete| !delete || preview.branch.is_some())
+                    .map(|delete_branch| {
+                        let label = match (force, preview.branch.is_some(), delete_branch) {
+                            (false, false, _) => "Confirmar retirada",
+                            (true, false, _) => "Confirmar retirada forzada",
+                            (false, true, false) => "Retirar y conservar rama",
+                            (true, true, false) => "Forzar retirada y conservar rama",
+                            (false, true, true) => "Retirar e intentar borrar rama",
+                            (true, true, true) => "Forzar retirada e intentar borrar rama",
+                        };
+                        button(label).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let project = preview.project.clone();
+                                let path = preview.path.clone();
+                                move |view, _, _, cx| {
+                                    view.worktree_removal = None;
+                                    view.send(
+                                        Request::RemoveWorktree {
+                                            project: project.clone(),
+                                            path: path.clone(),
+                                            force,
+                                            delete_branch,
+                                        },
+                                        cx,
+                                    );
+                                }
+                            }),
+                        )
+                    }),
             )
     }
 
@@ -1034,7 +1150,10 @@ impl Workspace {
     }
 
     fn session_agent(&self, index: usize) -> Agent {
-        self.panes[index].agent.unwrap_or(Agent::Codex)
+        self.panes
+            .get(index)
+            .and_then(|pane| pane.agent)
+            .unwrap_or(Agent::Codex)
     }
 
     fn session_button(&self, index: usize, label: String, cx: &Context<Self>) -> Div {
@@ -1116,6 +1235,16 @@ impl Workspace {
                         picker.occupied = Some(path);
                         picker.pending = false;
                     }
+                }
+                Ok(Reply::WorktreeRemoval(preview)) => self.worktree_removal = Some(preview),
+                Ok(Reply::WorktreeRemoved { retained_branch }) => {
+                    self.worktree_removal = None;
+                    self.status = match retained_branch {
+                        Some(branch) => {
+                            format!("Worktree retirado. Git conservó la rama {branch}.").into()
+                        }
+                        None => "Worktree retirado".into(),
+                    };
                 }
                 Ok(Reply::SessionStarted) => self.session_picker = None,
                 Ok(Reply::Error(error)) => {
