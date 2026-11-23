@@ -27,7 +27,7 @@ fn imports_only_metrics_and_retains_them_across_retries_and_source_removal() -> 
     assert_eq!(saved.len(), 1);
     assert_eq!(
         (saved[0].input, saved[0].cached, saved[0].output),
-        (100, 20, 10)
+        (Some(100), Some(20), Some(10))
     );
     assert_eq!(saved[0].model, "fixture-model");
 
@@ -42,7 +42,7 @@ fn imports_only_metrics_and_retains_them_across_retries_and_source_removal() -> 
     assert_eq!(saved.len(), 2);
     assert_eq!(
         (saved[1].input, saved[1].cached, saved[1].output),
-        (60, 10, 4)
+        (Some(60), Some(10), Some(4))
     );
     assert!(
         !fs::read(database)?
@@ -69,8 +69,14 @@ fn cumulative_usage_does_not_count_an_earlier_last_only_event_again() -> anyhow:
     store.scan(fixture.path())?;
     let events = store.saved()?;
     assert_eq!(events.len(), 2);
-    assert_eq!(events.iter().map(|event| event.input).sum::<i64>(), 130);
-    assert_eq!(events.iter().map(|event| event.output).sum::<i64>(), 12);
+    assert_eq!(
+        events.iter().filter_map(|event| event.input).sum::<i64>(),
+        130
+    );
+    assert_eq!(
+        events.iter().filter_map(|event| event.output).sum::<i64>(),
+        12
+    );
     Ok(())
 }
 
@@ -105,7 +111,7 @@ fn a_failed_write_rolls_back_the_file_and_can_be_retried() -> anyhow::Result<()>
         store
             .saved()?
             .iter()
-            .map(|event| event.input)
+            .filter_map(|event| event.input)
             .collect::<Vec<_>>(),
         vec![100, 60]
     );
@@ -143,12 +149,15 @@ fn imports_claude_usage_into_an_existing_codex_database() -> anyhow::Result<()> 
     assert_eq!(saved[0].agent, usage::UsageAgent::Codex);
     assert_eq!(
         (saved[0].input, saved[0].cached, saved[0].output),
-        (100, 20, 10)
+        (Some(100), Some(20), Some(10))
     );
     let claude = &saved[1];
     assert_eq!(claude.agent, usage::UsageAgent::Claude);
     assert_eq!(claude.model, "claude-sonnet");
-    assert_eq!((claude.input, claude.cached, claude.output), (100, 65, 12));
+    assert_eq!(
+        (claude.input, claude.cached, claude.output),
+        (Some(100), Some(65), Some(12))
+    );
     assert!(
         !fs::read(database)?
             .windows(b"SYNTHETIC_RESPONSE_MARKER".len())
@@ -177,8 +186,8 @@ fn claude_rescan_merges_replayed_messages_and_adds_one_new_event() -> anyhow::Re
         let events = store.saved()?;
         Ok((
             events.len(),
-            events.iter().map(|event| event.input).sum::<i64>(),
-            events.iter().map(|event| event.output).sum::<i64>(),
+            events.iter().filter_map(|event| event.input).sum::<i64>(),
+            events.iter().filter_map(|event| event.output).sum::<i64>(),
         ))
     };
     for _ in 0..2 {
@@ -204,5 +213,87 @@ fn claude_rescan_merges_replayed_messages_and_adds_one_new_event() -> anyhow::Re
     fs::remove_dir_all(fixture.path().join("projects"))?;
     reopened.scan_claude(fixture.path())?;
     assert_eq!(totals(&reopened)?, (2, 50, 16));
+    Ok(())
+}
+
+#[test]
+fn imports_only_copilot_usage_deltas_and_preserves_sparse_counters() -> anyhow::Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let session = home.join("session-state/session");
+    let copy = home.join("session-state/copy");
+    fs::create_dir_all(&session)?;
+    fs::create_dir_all(&copy)?;
+    let delta = r#"{"type":"session.usage_record","id":"event-1","timestamp":"2025-06-01T12:00:00Z","data":{"usage":{"model":"fixture-model","accounting":{"usageId":"usage-1"},"inputTokens":20,"cacheReadTokens":0,"outputTokens":3,"cacheWriteTokens":1,"duration":42},"content":"SYNTHETIC_COPILOT_PROMPT"}}"#;
+    let sparse = r#"{"type":"session.usage_record","id":"event-2","timestamp":"2025-06-01T13:00:00Z","data":{"usage":{"model":"fixture-model","outputTokens":0,"reasoningTokens":0,"cacheReadTokens":-1}}}"#;
+    let shutdown = r#"{"type":"session.shutdown","id":"event-3","timestamp":"2025-06-01T14:00:00Z","data":{"usage":{"model":"fixture-model","inputTokens":200}}}"#;
+    let source = session.join("events.jsonl");
+    fs::write(&source, format!("{delta}\n{shutdown}\n{sparse}"))?;
+    fs::write(session.join("other.jsonl"), format!("{sparse}\n"))?;
+    fs::write(
+        copy.join("events.jsonl"),
+        format!("{}\n", delta.replace("event-1", "copy-event")),
+    )?;
+    let database = home.join("edith.sqlite");
+    let legacy = rusqlite::Connection::open(&database)?;
+    legacy.execute_batch(
+        "CREATE TABLE usage_events (
+            identity BLOB NOT NULL PRIMARY KEY, timestamp INTEGER NOT NULL, model TEXT NOT NULL,
+            input INTEGER NOT NULL, cached INTEGER NOT NULL, output INTEGER NOT NULL,
+            agent TEXT NOT NULL DEFAULT 'codex'
+         );
+         INSERT INTO usage_events VALUES (X'01', 0, 'codex-model', 10, 2, 3, 'codex');
+         INSERT INTO usage_events VALUES (X'02', 1, 'claude-model', 11, 0, 4, 'claude');",
+    )?;
+    drop(legacy);
+    let store = UsageStore::new(database.clone());
+    store.scan_copilot(home)?;
+    assert_eq!(store.saved()?.len(), 3);
+
+    writeln!(fs::OpenOptions::new().append(true).open(&source)?)?;
+    store.scan_copilot(home)?;
+    store.scan_copilot(home)?;
+    fs::remove_dir_all(home.join("session-state"))?;
+    let reopened = UsageStore::new(database.clone());
+    reopened.scan_copilot(home)?;
+    let saved = reopened.saved()?;
+    assert_eq!(saved.len(), 4);
+    assert_eq!(
+        (saved[0].agent, saved[0].cached),
+        (usage::UsageAgent::Codex, Some(2))
+    );
+    assert_eq!(
+        (saved[1].agent, saved[1].cached),
+        (usage::UsageAgent::Claude, Some(0))
+    );
+    let saved = &saved[2..];
+    assert!(
+        saved
+            .iter()
+            .all(|event| event.agent == usage::UsageAgent::Copilot)
+    );
+    let first = &saved[0];
+    assert_eq!(
+        (first.input, first.cached, first.output),
+        (Some(20), Some(0), Some(3))
+    );
+    assert_eq!(
+        (first.cache_write, first.reasoning, first.api_duration_ms),
+        (Some(1), None, Some(42))
+    );
+    let second = &saved[1];
+    assert_eq!(
+        (second.input, second.cached, second.output),
+        (None, None, Some(0))
+    );
+    assert_eq!(
+        (second.cache_write, second.reasoning, second.api_duration_ms),
+        (None, Some(0), None)
+    );
+    assert!(
+        !fs::read(database)?
+            .windows(b"SYNTHETIC_COPILOT_PROMPT".len())
+            .any(|bytes| bytes == b"SYNTHETIC_COPILOT_PROMPT")
+    );
     Ok(())
 }

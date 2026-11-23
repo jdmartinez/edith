@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs::{self, File},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -12,10 +13,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[path = "usage/copilot.rs"]
+mod copilot;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UsageAgent {
     Codex,
     Claude,
+    Copilot,
 }
 
 impl UsageAgent {
@@ -23,6 +28,7 @@ impl UsageAgent {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Copilot => "copilot",
         }
     }
 }
@@ -32,9 +38,12 @@ pub struct UsageEvent {
     pub agent: UsageAgent,
     pub timestamp: i64,
     pub model: String,
-    pub input: i64,
-    pub cached: i64,
-    pub output: i64,
+    pub input: Option<i64>,
+    pub cached: Option<i64>,
+    pub output: Option<i64>,
+    pub cache_write: Option<i64>,
+    pub reasoning: Option<i64>,
+    pub api_duration_ms: Option<i64>,
 }
 
 pub struct UsageStore {
@@ -54,19 +63,21 @@ impl UsageStore {
             Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         database.busy_timeout(Duration::from_secs(5))?;
         let snapshot = database.transaction()?;
-        let agent_column = if has_agent_column(&snapshot)? {
-            "agent"
+        let agent_column = agent_column(&snapshot, "usage_events")?;
+        let extra_columns = if has_column(&snapshot, "api_duration_ms")? {
+            "cache_write, reasoning, api_duration_ms"
         } else {
-            "'codex'"
+            "NULL, NULL, NULL"
         };
         let mut query = snapshot.prepare(&format!(
-            "SELECT timestamp, model, input, cached, output, {agent_column}
+            "SELECT timestamp, model, input, cached, output, {agent_column}, {extra_columns}
              FROM usage_events ORDER BY timestamp",
         ))?;
         let events = query.query_map([], |row| {
             let agent = match row.get::<_, String>(5)?.as_str() {
                 "codex" => UsageAgent::Codex,
                 "claude" => UsageAgent::Claude,
+                "copilot" => UsageAgent::Copilot,
                 _ => return Err(rusqlite::Error::InvalidQuery),
             };
             Ok(UsageEvent {
@@ -76,6 +87,9 @@ impl UsageStore {
                 input: row.get(2)?,
                 cached: row.get(3)?,
                 output: row.get(4)?,
+                cache_write: row.get(6)?,
+                reasoning: row.get(7)?,
+                api_duration_ms: row.get(8)?,
             })
         })?;
         Ok(events.collect::<rusqlite::Result<_>>()?)
@@ -95,7 +109,14 @@ impl UsageStore {
         self.scan_directories(vec![claude_home.join("projects")], UsageAgent::Claude)
     }
 
-    fn scan_directories(&self, mut directories: Vec<PathBuf>, agent: UsageAgent) -> Result<()> {
+    pub fn scan_copilot(&self, copilot_home: &Path) -> Result<()> {
+        self.scan_directories(
+            vec![copilot_home.join("session-state")],
+            UsageAgent::Copilot,
+        )
+    }
+
+    fn open_for_import(&self) -> Result<Connection> {
         if let Some(parent) = self.database.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -103,26 +124,46 @@ impl UsageStore {
         database.busy_timeout(Duration::from_secs(5))?;
         database.execute_batch("PRAGMA journal_mode = WAL;")?;
         let schema = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !has_column(&schema, "api_duration_ms")? {
+            let legacy = has_column(&schema, "identity")?;
+            if legacy {
+                schema.execute_batch("ALTER TABLE usage_events RENAME TO legacy_usage_events;")?;
+            }
+            schema.execute_batch(
+                "CREATE TABLE usage_events (
+                    identity BLOB NOT NULL PRIMARY KEY,
+                    timestamp INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    input INTEGER,
+                    cached INTEGER,
+                    output INTEGER,
+                    agent TEXT NOT NULL DEFAULT 'codex',
+                    cache_write INTEGER,
+                    reasoning INTEGER,
+                    api_duration_ms INTEGER
+                 );",
+            )?;
+            if legacy {
+                let agent = agent_column(&schema, "legacy_usage_events")?;
+                schema.execute_batch(&format!(
+                    "INSERT INTO usage_events (identity, timestamp, model, input, cached, output, agent)
+                     SELECT identity, timestamp, model, input, cached, output, {agent} FROM legacy_usage_events;
+                     DROP TABLE legacy_usage_events;",
+                ))?;
+            }
+        }
         schema.execute_batch(
-            "CREATE TABLE IF NOT EXISTS usage_events (
-                identity BLOB NOT NULL PRIMARY KEY,
-                timestamp INTEGER NOT NULL,
-                model TEXT NOT NULL,
-                input INTEGER NOT NULL,
-                cached INTEGER NOT NULL,
-                output INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS usage_checkpoints (
+            "CREATE TABLE IF NOT EXISTS usage_checkpoints (
                 source BLOB NOT NULL PRIMARY KEY,
                 state TEXT NOT NULL
              );",
         )?;
-        if !has_agent_column(&schema)? {
-            schema.execute_batch(
-                "ALTER TABLE usage_events ADD COLUMN agent TEXT NOT NULL DEFAULT 'codex';",
-            )?;
-        }
         schema.commit()?;
+        Ok(database)
+    }
+
+    fn scan_directories(&self, mut directories: Vec<PathBuf>, agent: UsageAgent) -> Result<()> {
+        let mut database = self.open_for_import()?;
 
         let mut failure = None;
         while let Some(directory) = directories.pop() {
@@ -141,11 +182,7 @@ impl UsageStore {
                     let path = entry.path();
                     if kind.is_dir() {
                         directories.push(path);
-                    } else if kind.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|extension| extension == "jsonl")
-                    {
+                    } else if kind.is_file() && is_usage_log(&path, agent) {
                         import_file(&mut database, &path, agent)?;
                     }
                     Ok(())
@@ -159,10 +196,28 @@ impl UsageStore {
     }
 }
 
-fn has_agent_column(database: &Connection) -> rusqlite::Result<bool> {
+fn is_usage_log(path: &Path, agent: UsageAgent) -> bool {
+    match agent {
+        UsageAgent::Copilot => path.file_name().is_some_and(|name| name == "events.jsonl"),
+        _ => path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl"),
+    }
+}
+
+fn agent_column(database: &Connection, table: &str) -> rusqlite::Result<&'static str> {
+    let present: bool = database.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'agent')",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(if present { "agent" } else { "'codex'" })
+}
+
+fn has_column(database: &Connection, name: &str) -> rusqlite::Result<bool> {
     database.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_events') WHERE name = 'agent')",
-        [],
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_events') WHERE name = ?1)",
+        [name],
         |row| row.get(0),
     )
 }
@@ -225,15 +280,18 @@ fn import_file(database: &mut Connection, path: &Path, agent: UsageAgent) -> Res
     };
     let transaction = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    // Keep checkpoints already written by the Codex reader.
-    let claude_source;
+    // Keep existing Codex and Claude checkpoints. New Copilot checkpoints store a digest.
     let source = match agent {
-        UsageAgent::Codex => path_bytes,
-        UsageAgent::Claude => {
-            claude_source = [b"claude\0", path_bytes].concat();
-            &claude_source
+        UsageAgent::Codex => Cow::Borrowed(path_bytes),
+        UsageAgent::Claude => Cow::Owned([b"claude\0", path_bytes].concat()),
+        UsageAgent::Copilot => {
+            let mut digest = Sha256::new();
+            digest.update(b"copilot\0");
+            digest.update(path_bytes);
+            Cow::Owned(digest.finalize().to_vec())
         }
     };
+    let source = source.as_ref();
     let previous: Option<String> = transaction
         .query_row(
             "SELECT state FROM usage_checkpoints WHERE source = ?1",
@@ -256,8 +314,8 @@ fn import_file(database: &mut Connection, path: &Path, agent: UsageAgent) -> Res
     let start = state.offset;
     let mut line = Vec::new();
     let mut insert = transaction.prepare(
-        "INSERT INTO usage_events (identity, timestamp, model, input, cached, output, agent)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO usage_events (identity, timestamp, model, input, cached, output, agent, cache_write, reasoning, api_duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT (identity) DO UPDATE SET
             timestamp = min(usage_events.timestamp, excluded.timestamp),
             input = max(usage_events.input, excluded.input),
@@ -279,6 +337,7 @@ fn import_file(database: &mut Connection, path: &Path, agent: UsageAgent) -> Res
         let event = match agent {
             UsageAgent::Codex => normalize(&line, &mut state),
             UsageAgent::Claude => normalize_claude(&line),
+            UsageAgent::Copilot => copilot::normalize(&line),
         };
         if let Some((identity, event)) = event {
             insert.execute(params![
@@ -288,7 +347,10 @@ fn import_file(database: &mut Connection, path: &Path, agent: UsageAgent) -> Res
                 event.input,
                 event.cached,
                 event.output,
-                event.agent.key()
+                event.agent.key(),
+                event.cache_write,
+                event.reasoning,
+                event.api_duration_ms
             ])?;
         }
     }
@@ -375,9 +437,12 @@ fn normalize(line: &[u8], state: &mut Checkpoint) -> Option<(Vec<u8>, UsageEvent
             agent: UsageAgent::Codex,
             timestamp: timestamp.timestamp(),
             model: model.to_owned(),
-            input: tokens.input,
-            cached: tokens.cached,
-            output: tokens.output,
+            input: Some(tokens.input),
+            cached: Some(tokens.cached),
+            output: Some(tokens.output),
+            cache_write: None,
+            reasoning: None,
+            api_duration_ms: None,
         },
     ))
 }
@@ -421,9 +486,12 @@ fn normalize_claude(line: &[u8]) -> Option<(Vec<u8>, UsageEvent)> {
             agent: UsageAgent::Claude,
             timestamp: timestamp.timestamp(),
             model: model.to_owned(),
-            input,
-            cached: i64::try_from(cached).ok()?,
-            output,
+            input: Some(input),
+            cached: Some(i64::try_from(cached).ok()?),
+            output: Some(output),
+            cache_write: None,
+            reasoning: None,
+            api_duration_ms: None,
         },
     ))
 }

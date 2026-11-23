@@ -49,15 +49,17 @@ impl UsagePanel {
                 });
                 return;
             };
-            if let Ok(events) = store.saved() {
-                if send.send(Update::Saved(summarize(events))).is_err() {
-                    return;
-                }
+            if let Ok(events) = store.saved()
+                && send.send(Update::Saved(summarize(events))).is_err()
+            {
+                return;
             }
             let codex = agent_home("CODEX_HOME", ".codex").and_then(|home| store.scan(&home));
             let claude = agent_home("CLAUDE_CONFIG_DIR", ".claude")
                 .and_then(|home| store.scan_claude(&home));
-            let incomplete = codex.is_err() || claude.is_err();
+            let copilot =
+                agent_home("COPILOT_HOME", ".copilot").and_then(|home| store.scan_copilot(&home));
+            let incomplete = codex.is_err() || claude.is_err() || copilot.is_err();
             let _ = send.send(Update::Finished {
                 history: store.saved().map(summarize),
                 incomplete,
@@ -107,15 +109,11 @@ impl UsagePanel {
     }
 
     pub fn content(&self) -> Div {
-        if self.summaries.is_empty() {
+        if self.summaries.is_empty() && self.scanning() {
             return div()
                 .p_6()
                 .text_color(rgb(0xaab8cc))
-                .child(if self.scanning() {
-                    "Buscando métricas locales…"
-                } else {
-                    "Todavía no hay métricas guardadas."
-                });
+                .child("Buscando métricas locales…");
         }
         div()
             .flex()
@@ -126,14 +124,25 @@ impl UsagePanel {
                 let name = match agent {
                     UsageAgent::Codex => "Codex",
                     UsageAgent::Claude => "Claude Code",
+                    UsageAgent::Copilot => "GitHub Copilot CLI",
                 };
-                summary.content(name)
+                summary.content(name, *agent)
             }))
+            .when(
+                !self.summaries.contains_key(&UsageAgent::Copilot),
+                |panel| {
+                    panel.child(
+                        card()
+                            .child(div().text_xl().child("GitHub Copilot CLI"))
+                            .child("Sin métricas locales verificables guardadas."),
+                    )
+                },
+            )
     }
 }
 
 impl Summary {
-    fn content(&self, name: &'static str) -> Div {
+    fn content(&self, name: &'static str, agent: UsageAgent) -> Div {
         let Self {
             total,
             days,
@@ -141,7 +150,11 @@ impl Summary {
         } = self;
         let mut models = models.iter().collect::<Vec<_>>();
         models.sort_by(|(a, first), (b, second)| {
-            second.input.cmp(&first.input).then_with(|| a.cmp(b))
+            second
+                .input
+                .sum
+                .cmp(&first.input.sum)
+                .then_with(|| a.cmp(b))
         });
         div()
             .flex()
@@ -156,6 +169,20 @@ impl Summary {
                     .child(metric("Tokens de salida", total.output, 0xf0b687))
                     .child(metric("Entrada en caché", total.cached, 0xc4b6ff)),
             )
+            .when(agent == UsageAgent::Copilot, |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(metric("Escritura en caché", total.cache_write, 0xc4b6ff))
+                        .child(metric("Tokens de razonamiento", total.reasoning, 0xf0b687))
+                        .child(metric(
+                            "Tiempo de API (ms)",
+                            total.api_duration_ms,
+                            0x87e0cd,
+                        )),
+                )
+            })
             .child(daily_chart(days))
             .child(
                 card()
@@ -165,7 +192,7 @@ impl Summary {
                             .text_color(rgb(0xaab8cc)),
                     )
                     .children(models.iter().map(|(model, tokens)| {
-                        model_row(model, tokens.input.to_string(), tokens.output.to_string())
+                        model_row(model, tokens.input.label(), tokens.output.label())
                     })),
             )
     }
@@ -219,16 +246,45 @@ fn summarize(events: Vec<UsageEvent>) -> Summaries {
 
 #[derive(Default)]
 struct Totals {
-    input: u64,
-    cached: u64,
-    output: u64,
+    input: Metric,
+    cached: Metric,
+    output: Metric,
+    cache_write: Metric,
+    reasoning: Metric,
+    api_duration_ms: Metric,
 }
 
 impl Totals {
     fn add(&mut self, event: &UsageEvent) {
-        self.input = self.input.saturating_add(event.input as u64);
-        self.cached = self.cached.saturating_add(event.cached as u64);
-        self.output = self.output.saturating_add(event.output as u64);
+        self.input.add(event.input);
+        self.cached.add(event.cached);
+        self.output.add(event.output);
+        self.cache_write.add(event.cache_write);
+        self.reasoning.add(event.reasoning);
+        self.api_duration_ms.add(event.api_duration_ms);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Metric {
+    sum: Option<u64>,
+    partial: bool,
+}
+
+impl Metric {
+    fn add(&mut self, amount: Option<i64>) {
+        match amount.and_then(|amount| u64::try_from(amount).ok()) {
+            Some(amount) => self.sum = Some(self.sum.unwrap_or_default().saturating_add(amount)),
+            None => self.partial = true,
+        }
+    }
+
+    fn label(self) -> String {
+        match self.sum {
+            Some(sum) if self.partial => format!("{sum} (parcial)"),
+            Some(sum) => sum.to_string(),
+            None => "Sin datos".into(),
+        }
     }
 }
 
@@ -244,7 +300,7 @@ fn card() -> Div {
         .border_color(rgb(0x2a3a50))
 }
 
-fn metric(label: &'static str, amount: u64, color: u32) -> Div {
+fn metric(label: &'static str, amount: Metric, color: u32) -> Div {
     card()
         .flex_1()
         .child(div().text_sm().text_color(rgb(0xaab8cc)).child(label))
@@ -252,7 +308,7 @@ fn metric(label: &'static str, amount: u64, color: u32) -> Div {
             div()
                 .text_2xl()
                 .text_color(rgb(color))
-                .child(amount.to_string()),
+                .child(amount.label()),
         )
 }
 
@@ -273,20 +329,16 @@ fn daily_chart(days: &BTreeMap<i64, Totals>) -> Div {
     let first = (*days.first_key_value().unwrap().0).max(last - 29);
     let peak_input = days
         .range(first..)
-        .map(|(_, time)| time.input)
-        .max()
-        .unwrap_or(1)
-        .max(1);
+        .filter_map(|(_, time)| time.input.sum)
+        .max();
     let peak_output = days
         .range(first..)
-        .map(|(_, time)| time.output)
-        .max()
-        .unwrap_or(1)
-        .max(1);
+        .filter_map(|(_, time)| time.output.sum)
+        .max();
     let bars = (first..=last).map(|day| {
         let (input, output) = days
             .get(&day)
-            .map_or((0, 0), |totals| (totals.input, totals.output));
+            .map_or((None, None), |totals| (totals.input.sum, totals.output.sum));
         div()
             .flex()
             .flex_1()
@@ -297,7 +349,7 @@ fn daily_chart(days: &BTreeMap<i64, Totals>) -> Div {
                 div().flex().flex_col().justify_end().h(px(50.0)).child(
                     div()
                         .w_full()
-                        .h(px(50.0 * (input as f32 / peak_input as f32)))
+                        .h(px(50.0 * bar_ratio(input, peak_input)))
                         .bg(rgb(0x87e0cd)),
                 ),
             )
@@ -311,7 +363,7 @@ fn daily_chart(days: &BTreeMap<i64, Totals>) -> Div {
                     .child(
                         div()
                             .w_full()
-                            .h(px(49.0 * (output as f32 / peak_output as f32)))
+                            .h(px(49.0 * bar_ratio(output, peak_output)))
                             .bg(rgb(0xf0b687)),
                     ),
             )
@@ -331,12 +383,12 @@ fn daily_chart(days: &BTreeMap<i64, Totals>) -> Div {
                 .child(
                     div()
                         .text_color(rgb(0x87e0cd))
-                        .child(format!("Entrada · máx. {peak_input}")),
+                        .child(format!("Entrada · máx. {}", peak_label(peak_input))),
                 )
                 .child(
                     div()
                         .text_color(rgb(0xf0b687))
-                        .child(format!("Salida · máx. {peak_output}")),
+                        .child(format!("Salida · máx. {}", peak_label(peak_output))),
                 ),
         )
         .child(div().flex().gap_1().children(bars))
@@ -353,4 +405,12 @@ fn daily_chart(days: &BTreeMap<i64, Totals>) -> Div {
                     date(last)
                 }),
         )
+}
+
+fn bar_ratio(amount: Option<u64>, peak: Option<u64>) -> f32 {
+    amount.unwrap_or_default() as f32 / peak.unwrap_or_default().max(1) as f32
+}
+
+fn peak_label(peak: Option<u64>) -> String {
+    peak.map_or_else(|| "Sin datos".into(), |peak| peak.to_string())
 }
