@@ -9,6 +9,7 @@ use crate::panels::{DesktopLayout, Panel};
 use crate::usage_panel::UsagePanel;
 
 use super::client::INTERVAL;
+use super::notifications::{Notifications, deliver_attention};
 use desktop::PanelDrag;
 use prototype::Divider;
 use sessions::Sessions;
@@ -32,8 +33,10 @@ pub(super) struct Workspace {
     desktop: bool,
     sidebar_visible: bool,
     usage: UsagePanel,
+    notifications: Notifications,
     sessions: Sessions,
     terminal_projects: Vec<PathBuf>,
+    retention_days: Option<u32>,
     project_dir: String,
     connected: bool,
     layout: Layout,
@@ -84,8 +87,10 @@ impl Workspace {
             desktop,
             sidebar_visible: true,
             usage: UsagePanel::default(),
+            notifications: Notifications::default(),
             sessions: Sessions::new(cx.focus_handle()),
             terminal_projects: Vec::new(),
+            retention_days: Some(30),
             project_dir: String::new(),
             connected: false,
             layout: Layout::default(),
@@ -115,6 +120,7 @@ impl Workspace {
                     worktrees,
                     agent_executables,
                     terminal_projects,
+                    retention_days,
                 }) => {
                     if self.desktop {
                         self.panels_supported = desktop_layout.is_some();
@@ -133,6 +139,7 @@ impl Workspace {
                     self.sessions
                         .update_projects(projects, worktrees, agent_executables);
                     self.terminal_projects = terminal_projects;
+                    self.retention_days = retention_days;
                     self.panes.resize_with(panes.len(), Snapshot::default);
                     self.sizes.resize(panes.len(), (0, 0));
                     if self.active >= panes.len() {
@@ -146,9 +153,18 @@ impl Workspace {
                     if !self.connected {
                         self.status = "Host conectado".into();
                     }
+                    let initial_connection = !self.connected;
                     self.connected = true;
                     for (index, pane) in panes.into_iter().enumerate() {
                         if let Some(snapshot) = pane {
+                            if self.notifications.observe(
+                                index,
+                                snapshot.pid,
+                                snapshot.attention,
+                                initial_connection,
+                            ) {
+                                deliver_attention();
+                            }
                             self.panes[index] = snapshot;
                         }
                     }

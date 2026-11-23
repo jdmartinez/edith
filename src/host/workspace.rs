@@ -10,14 +10,15 @@ use super::git::{
     inspect_worktree_removal, occupied_checkout, remove_worktree, repository, scan_projects,
     session_directories, validate_branch_name,
 };
-use super::protocol::{Agent, Layout, Reply, Request, SessionTarget, Snapshot};
+use super::protocol::{
+    Agent, Layout, Reply, Request, SessionTarget, Snapshot, default_retention_days,
+};
 use super::terminal::{Terminal, detect_agent, is_executable};
 
 mod persistence;
 
 pub(super) use persistence::WorkspaceStore;
 
-#[derive(Default)]
 pub(super) struct WorkspaceState {
     layout: DesktopLayout,
     projects: Vec<Repository>,
@@ -25,9 +26,55 @@ pub(super) struct WorkspaceState {
     terminal_projects: Vec<PathBuf>,
     worktree_removal: Option<WorktreeRemoval>,
     conversations: BTreeMap<usize, uuid::Uuid>,
+    retention_days: Option<u32>,
+}
+
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        Self {
+            layout: DesktopLayout::default(),
+            projects: Vec::new(),
+            agent_executables: BTreeMap::new(),
+            terminal_projects: Vec::new(),
+            worktree_removal: None,
+            conversations: BTreeMap::new(),
+            retention_days: default_retention_days(),
+        }
+    }
 }
 
 impl WorkspaceState {
+    fn forget_closed(
+        &mut self,
+        terminals: &mut [Result<Terminal, Snapshot>],
+        pane: usize,
+    ) -> Result<()> {
+        let project = self
+            .terminal_projects
+            .get_mut(pane)
+            .context("Sesión desconocida")?;
+        ensure!(!project.as_os_str().is_empty(), "Sesión desconocida");
+        let slot = &mut terminals[pane];
+        let snapshot = match slot {
+            Ok(terminal) => terminal
+                .snapshot(0)?
+                .context("Falta la captura de una sesión")?,
+            Err(snapshot) => snapshot.clone(),
+        };
+        ensure!(snapshot.exited, "La sesión sigue abierta");
+        if self.layout.root.contains(pane) {
+            self.layout.hide(pane)?;
+        }
+        // Retire the slot without moving the identities of later panes.
+        *project = PathBuf::new();
+        self.conversations.remove(&pane);
+        *slot = Err(Snapshot {
+            revision: snapshot.revision + 1,
+            ..Snapshot::default()
+        });
+        Ok(())
+    }
+
     fn add(&mut self, project: Repository) {
         if let Some(existing) = self
             .projects
@@ -89,6 +136,7 @@ pub(super) fn dispatch(
                 terminal_projects: workspace
                     .as_ref()
                     .map_or_else(Vec::new, |state| state.terminal_projects.clone()),
+                retention_days: workspace.as_ref().and_then(|state| state.retention_days),
             });
         }
         Request::Input { pane, bytes } => terminals
@@ -114,7 +162,13 @@ pub(super) fn dispatch(
                 PanelAction::Split { pane, axis } => state.layout.split(pane, axis)?,
                 PanelAction::Resize { path, ratio } => state.layout.resize(&path, ratio)?,
                 PanelAction::Show { pane } => {
-                    ensure!(pane < terminals.len(), "Sesión desconocida");
+                    ensure!(
+                        state
+                            .terminal_projects
+                            .get(pane)
+                            .is_some_and(|project| !project.as_os_str().is_empty()),
+                        "Sesión desconocida"
+                    );
                     state.layout.show(pane)?;
                 }
                 PanelAction::Hide { pane } => state.layout.hide(pane)?,
@@ -303,12 +357,13 @@ pub(super) fn dispatch(
             };
             let identifier = conversation.map(|id| id.to_string());
             let args = identifier.as_deref().map(|id| ["--session-id", id]);
-            let mut terminal = Terminal::launch(
+            let terminal = Terminal::launch_agent(
                 program.as_os_str(),
-                true,
+                agent,
                 &directory,
                 args.as_ref().map_or(&[], |args| args.as_slice()),
                 1,
+                conversation,
             )
             .with_context(|| {
                 format!(
@@ -317,7 +372,6 @@ pub(super) fn dispatch(
                     program.display()
                 )
             })?;
-            terminal.set_agent(agent);
             if let Some(conversation) = conversation {
                 state.conversations.insert(pane, conversation);
             }
@@ -378,6 +432,18 @@ pub(super) fn dispatch(
                 }
             }
         }
+        Request::ForgetClosedSession(pane) => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            state.forget_closed(terminals, pane)?;
+        }
+        Request::SetRetentionDays(days) => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            ensure!(
+                days.is_none_or(|days| days > 0),
+                "El plazo debe ser de al menos un día"
+            );
+            state.retention_days = days;
+        }
         Request::Stop => {}
     }
     Ok(Reply::Ok)
@@ -390,21 +456,21 @@ fn reattach(
     id: uuid::Uuid,
     revision: u64,
 ) -> Result<Terminal> {
-    let id = id.to_string();
+    let identifier = id.to_string();
     let args = match agent {
-        Agent::Codex => ["resume", id.as_str()],
-        Agent::Claude | Agent::Copilot => ["--resume", id.as_str()],
+        Agent::Codex => ["resume", identifier.as_str()],
+        Agent::Claude | Agent::Copilot => ["--resume", identifier.as_str()],
     };
     let program = agent_program(state, agent)?;
-    let mut next = Terminal::launch(
+    let mut next = Terminal::launch_agent(
         program.as_os_str(),
-        true,
+        agent,
         &previous.directory,
         &args,
         revision,
+        Some(id),
     )
     .with_context(|| format!("No se pudo reanudar {}", agent.name()))?;
-    next.set_agent(agent);
     let mut backup = previous.clone();
     backup.exited = true;
     backup.pid = None;

@@ -8,6 +8,38 @@ use crate::ui::controls::button;
 use super::Workspace;
 
 impl Workspace {
+    pub(super) fn session_retention_controls(&self, cx: &Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child("Limpieza de sesiones cerradas")
+            .child(
+                div().flex().flex_wrap().gap_1().children(
+                    [
+                        (Some(7), "7 días"),
+                        (Some(30), "30 días"),
+                        (Some(90), "90 días"),
+                        (None, "Desactivada"),
+                    ]
+                    .into_iter()
+                    .map(|(days, label)| {
+                        let label = if self.retention_days == days {
+                            format!("✓ {label}")
+                        } else {
+                            label.to_owned()
+                        };
+                        button(label).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, _, _, cx| {
+                                view.send(Request::SetRetentionDays(days), cx);
+                            }),
+                        )
+                    }),
+                ),
+            )
+    }
+
     pub(super) fn closed_sessions(&self, project: &Path, cx: &Context<Self>) -> Div {
         let panes: Vec<_> = self
             .terminal_projects
@@ -69,6 +101,14 @@ impl Workspace {
                         .text_color(rgb(0xf0b687))
                         .child(error.clone()),
                 )
+            })
+            .when(self.connected, |row| {
+                row.child(button("Retirar sesión de Edith").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        view.send(Request::ForgetClosedSession(pane), cx);
+                    }),
+                ))
             })
             .when(self.connected && snapshot.can_resume, |row| {
                 row.child(

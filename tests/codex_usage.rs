@@ -2,7 +2,102 @@
 mod usage;
 
 use std::{fs, io::Write};
-use usage::UsageStore;
+use usage::{UsageAgent, UsageStore};
+
+#[test]
+fn erases_selected_metrics_without_reimporting_deleted_records() -> anyhow::Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let sessions = home.join("sessions");
+    let archived = home.join("archived_sessions");
+    let projects = home.join("projects");
+    for directory in [&sessions, &archived, &projects] {
+        fs::create_dir(directory)?;
+    }
+    let rollout = sessions.join("original.jsonl");
+    fs::write(
+        &rollout,
+        r#"{"type":"session_meta","payload":{"id":"fixture-session"}}
+{"timestamp":"2025-06-01T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}
+"#,
+    )?;
+    let claude = projects.join("session.jsonl");
+    fs::write(
+        &claude,
+        r#"{"type":"assistant","timestamp":"2025-06-01T12:01:00Z","uuid":"entry-1","message":{"model":"fixture","usage":{"input_tokens":8,"output_tokens":1}}}
+"#,
+    )?;
+    let database = home.join("usage.sqlite");
+    let store = UsageStore::new(database.clone());
+    store.scan(home)?;
+    store.scan_claude(home)?;
+    assert_eq!(store.saved()?.len(), 2);
+
+    store.erase(Some(UsageAgent::Codex))?;
+    assert_eq!(store.saved()?[0].agent, UsageAgent::Claude);
+    fs::copy(&rollout, archived.join("copy.jsonl"))?;
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&rollout)?,
+        "{}",
+        serde_json::json!({
+            "timestamp": "2025-06-01T13:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": { "total_token_usage": { "input_tokens": 130, "output_tokens": 12 } }
+            }
+        }),
+    )?;
+    let store = UsageStore::new(database);
+    store.scan(home)?;
+    let events = store.saved()?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        (events[1].agent, events[1].input),
+        (UsageAgent::Codex, Some(30))
+    );
+
+    store.erase(None)?;
+    store.erase(None)?;
+    fs::rename(&rollout, archived.join("moved.jsonl"))?;
+    fs::rename(&claude, projects.join("moved.jsonl"))?;
+    store.scan(home)?;
+    store.scan_claude(home)?;
+    assert!(store.saved()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn erasure_failure_rolls_back_tombstones() -> anyhow::Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let projects = home.join("projects");
+    fs::create_dir(&projects)?;
+    fs::write(
+        projects.join("session.jsonl"),
+        r#"{"type":"assistant","timestamp":"2025-06-01T12:01:00Z","uuid":"entry-1","message":{"model":"fixture","usage":{"input_tokens":8,"output_tokens":1}}}
+"#,
+    )?;
+    let database = home.join("usage.sqlite");
+    let store = UsageStore::new(database.clone());
+    store.scan_claude(home)?;
+    let connection = rusqlite::Connection::open(database)?;
+    connection.execute_batch(
+        "CREATE TRIGGER fail_erase BEFORE DELETE ON usage_events
+         BEGIN SELECT RAISE(ABORT, 'synthetic erase failure'); END;",
+    )?;
+    assert!(store.erase(None).is_err());
+    assert_eq!(store.saved()?.len(), 1);
+    let tombstones: i64 =
+        connection.query_row("SELECT count(*) FROM erased_usage_events", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(tombstones, 0);
+    connection.execute_batch("DROP TRIGGER fail_erase;")?;
+    store.erase(None)?;
+    assert!(store.saved()?.is_empty());
+    Ok(())
+}
 
 #[test]
 fn imports_only_metrics_and_retains_them_across_retries_and_source_removal() -> anyhow::Result<()> {

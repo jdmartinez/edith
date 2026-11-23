@@ -31,6 +31,7 @@ pub(super) fn poll(
                     worktrees,
                     agent_executables,
                     terminal_projects,
+                    retention_days,
                 }) => {
                     let metadata = (
                         projects,
@@ -38,6 +39,7 @@ pub(super) fn poll(
                         agent_executables,
                         terminal_projects,
                         desktop_layout,
+                        retention_days,
                     );
                     let changed = initial
                         || disconnected
@@ -63,6 +65,7 @@ pub(super) fn poll(
                                 worktrees: workspace.1.clone(),
                                 agent_executables: workspace.2.clone(),
                                 terminal_projects: workspace.3.clone(),
+                                retention_days: workspace.5,
                             }))
                             .is_err()
                     {

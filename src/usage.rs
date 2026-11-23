@@ -116,6 +116,26 @@ impl UsageStore {
         )
     }
 
+    pub fn erase(&self, agent: Option<UsageAgent>) -> Result<()> {
+        let mut database = self.open_for_import()?;
+        database.pragma_update(None, "secure_delete", true)?;
+        let transaction = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let agent = agent.map(UsageAgent::key);
+        // Keep only the erased identities so an archived or rewritten log cannot restore them.
+        // Source checkpoints still provide the baseline for the next cumulative token record.
+        transaction.execute(
+            "INSERT OR IGNORE INTO erased_usage_events (identity)
+             SELECT identity FROM usage_events WHERE ?1 IS NULL OR agent = ?1",
+            [agent],
+        )?;
+        transaction.execute(
+            "DELETE FROM usage_events WHERE ?1 IS NULL OR agent = ?1",
+            [agent],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn open_for_import(&self) -> Result<Connection> {
         if let Some(parent) = self.database.parent() {
             fs::create_dir_all(parent)?;
@@ -156,7 +176,10 @@ impl UsageStore {
             "CREATE TABLE IF NOT EXISTS usage_checkpoints (
                 source BLOB NOT NULL PRIMARY KEY,
                 state TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS erased_usage_events (
+                identity BLOB NOT NULL PRIMARY KEY
+             ) WITHOUT ROWID;",
         )?;
         schema.commit()?;
         Ok(database)
@@ -315,7 +338,8 @@ fn import_file(database: &mut Connection, path: &Path, agent: UsageAgent) -> Res
     let mut line = Vec::new();
     let mut insert = transaction.prepare(
         "INSERT INTO usage_events (identity, timestamp, model, input, cached, output, agent, cache_write, reasoning, api_duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+         WHERE NOT EXISTS (SELECT 1 FROM erased_usage_events WHERE identity = ?1)
          ON CONFLICT (identity) DO UPDATE SET
             timestamp = min(usage_events.timestamp, excluded.timestamp),
             input = max(usage_events.input, excluded.input),

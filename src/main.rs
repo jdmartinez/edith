@@ -15,6 +15,11 @@ use host::{Endpoint, Layout, PANE_COUNT, Reply, Request, Snapshot};
 
 fn main() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
+    if let [flag, path, session] = args.as_slice()
+        && flag == host::HOOK_ARGUMENT
+    {
+        return host::record_claude_hook(std::path::Path::new(path), session);
+    }
     let desktop = !args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--agents" | "--prototype" | "--host"));

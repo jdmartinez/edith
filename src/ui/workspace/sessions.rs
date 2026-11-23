@@ -113,6 +113,24 @@ impl Workspace {
                 MouseButton::Left,
                 cx.listener(|view, _, _, cx| view.choose_path(PathAction::ScanProjects, cx)),
             ))
+            .when(self.connected, |sidebar| {
+                let enabled = self.notifications.enabled();
+                sidebar.child(self.session_retention_controls(cx)).child(
+                    button(if enabled {
+                        "Desactivar avisos del sistema"
+                    } else {
+                        "Activar avisos del sistema"
+                    })
+                    .mb_3()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.notifications.set_enabled(!enabled);
+                            cx.notify();
+                        }),
+                    ),
+                )
+            })
             .when_some(self.sessions.discovery.as_ref(), |sidebar, candidates| {
                 sidebar.child(self.discovery_panel(candidates, cx))
             })
@@ -185,21 +203,12 @@ impl Workspace {
                                 *owner == project && !self.panes[*index].exited
                             })
                             .map(|(index, _)| {
-                                let state = if self.connected {
-                                    "Abierta"
-                                } else {
-                                    "Sin conexión"
-                                };
                                 let hidden = self.panels_supported
                                     && !self.desktop_layout.root.contains(index)
                                     && !self.panes[index].closed_by_user;
                                 self.session_button(
                                     index,
-                                    format!(
-                                        "{} {} · {state}",
-                                        self.session_agent(index).name(),
-                                        index + 1
-                                    ),
+                                    format!("{} {}", self.session_agent(index).name(), index + 1),
                                     cx,
                                 )
                                 .when(hidden, |row| {

@@ -11,7 +11,7 @@ use crate::panels::DesktopLayout;
 
 use super::{WorkspaceState, reattach};
 use crate::host::git::Repository;
-use crate::host::protocol::{Agent, Reply, Request, Snapshot};
+use crate::host::protocol::{Agent, Reply, Request, Snapshot, default_retention_days};
 use crate::host::terminal::Terminal;
 
 const VERSION: u32 = 1;
@@ -23,6 +23,8 @@ struct Manifest {
     projects: Vec<Repository>,
     agent_executables: BTreeMap<Agent, PathBuf>,
     sessions: Vec<Session>,
+    #[serde(default = "default_retention_days")]
+    retention_days: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -65,6 +67,7 @@ impl WorkspaceStore {
             layout: manifest.layout,
             projects: manifest.projects,
             agent_executables: manifest.agent_executables,
+            retention_days: manifest.retention_days,
             ..WorkspaceState::default()
         };
         for (pane, session) in manifest.sessions.into_iter().enumerate() {
@@ -81,10 +84,15 @@ impl WorkspaceStore {
             store
                 .last_closed
                 .push((session.snapshot.exited, session.closed_at));
-            terminals.push(restore_session(&state, session.snapshot, conversation));
+            if state.terminal_projects[pane].as_os_str().is_empty() {
+                terminals.push(Err(session.snapshot));
+            } else {
+                terminals.push(restore_session(&state, session.snapshot, conversation));
+            }
         }
         // Commit the results of this recovery. Failed launches remain available
         // for an explicit retry without another automatic attempt on restart.
+        store.expire_closed(&mut state, terminals)?;
         store.save(&state, terminals)?;
         Ok((store, state))
     }
@@ -101,8 +109,32 @@ impl WorkspaceStore {
                 | Request::StartSession { .. }
                 | Request::ResumeSession { .. }
                 | Request::LinkConversation { .. }
+                | Request::ForgetClosedSession(_)
+                | Request::SetRetentionDays(_)
                 | Request::Stop
         )
+    }
+
+    pub(in crate::host) fn expire_closed(
+        &mut self,
+        state: &mut WorkspaceState,
+        terminals: &mut [Result<Terminal, Snapshot>],
+    ) -> Result<bool> {
+        let Some(days) = state.retention_days else {
+            return Ok(false);
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let duration = u64::from(days) * 86_400;
+        let mut changed = false;
+        for (pane, (closed, timestamp)) in self.last_closed.iter().enumerate() {
+            if *closed && timestamp.is_some_and(|date| now.saturating_sub(date) >= duration) {
+                if !state.terminal_projects[pane].as_os_str().is_empty() {
+                    state.forget_closed(terminals, pane)?;
+                }
+                changed = true;
+            }
+        }
+        Ok(changed)
     }
 
     pub(in crate::host) fn saw_exit(&self, reply: &Reply) -> bool {
@@ -154,6 +186,7 @@ impl WorkspaceStore {
             projects: state.projects.clone(),
             agent_executables: state.agent_executables.clone(),
             sessions,
+            retention_days: state.retention_days,
         };
         let directory = self
             .path

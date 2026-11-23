@@ -53,6 +53,8 @@ impl Agent {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub(crate) attention: super::attention::AttentionStatus,
     pub revision: u64,
     pub label: String,
     #[serde(default)]
@@ -128,6 +130,8 @@ pub enum Request {
         rows: u16,
         cols: u16,
     },
+    ForgetClosedSession(usize),
+    SetRetentionDays(Option<u32>),
     SetLayout(Layout),
     Panel(PanelAction),
     Stop,
@@ -162,6 +166,8 @@ pub enum Reply {
         agent_executables: BTreeMap<Agent, PathBuf>,
         #[serde(default)]
         terminal_projects: Vec<PathBuf>,
+        #[serde(default = "default_retention_days")]
+        retention_days: Option<u32>,
     },
     Discovered(Vec<Repository>),
     Directories(SessionDirectories),
@@ -173,4 +179,8 @@ pub enum Reply {
     SessionStarted,
     Ok,
     Error(String),
+}
+
+pub(super) fn default_retention_days() -> Option<u32> {
+    Some(30)
 }
