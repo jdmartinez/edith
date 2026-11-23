@@ -111,3 +111,98 @@ fn a_failed_write_rolls_back_the_file_and_can_be_retried() -> anyhow::Result<()>
     );
     Ok(())
 }
+
+#[test]
+fn imports_claude_usage_into_an_existing_codex_database() -> anyhow::Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let database = home.join("edith.sqlite");
+    let legacy = rusqlite::Connection::open(&database)?;
+    legacy.execute_batch(
+        "CREATE TABLE usage_events (
+            identity BLOB NOT NULL PRIMARY KEY,
+            timestamp INTEGER NOT NULL, model TEXT NOT NULL,
+            input INTEGER NOT NULL, cached INTEGER NOT NULL, output INTEGER NOT NULL
+         );
+         INSERT INTO usage_events VALUES (X'01', 0, 'codex-model', 100, 20, 10);",
+    )?;
+    drop(legacy);
+
+    let project = home.join("projects/project");
+    fs::create_dir_all(&project)?;
+    fs::write(
+        project.join("session.jsonl"),
+        r#"{"type":"assistant","timestamp":"2025-06-01T12:00:00Z","uuid":"entry-1","requestId":"req_1","message":{"id":"msg_1","model":"claude-sonnet","content":[{"type":"text","text":"SYNTHETIC_RESPONSE_MARKER"}],"usage":{"input_tokens":5,"cache_creation_input_tokens":30,"cache_read_input_tokens":65,"output_tokens":12}}}
+"#,
+    )?;
+    let store = UsageStore::new(database.clone());
+    assert_eq!(store.saved()?[0].agent, usage::UsageAgent::Codex);
+    store.scan_claude(home)?;
+    let saved = store.saved()?;
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[0].agent, usage::UsageAgent::Codex);
+    assert_eq!(
+        (saved[0].input, saved[0].cached, saved[0].output),
+        (100, 20, 10)
+    );
+    let claude = &saved[1];
+    assert_eq!(claude.agent, usage::UsageAgent::Claude);
+    assert_eq!(claude.model, "claude-sonnet");
+    assert_eq!((claude.input, claude.cached, claude.output), (100, 65, 12));
+    assert!(
+        !fs::read(database)?
+            .windows(b"SYNTHETIC_RESPONSE_MARKER".len())
+            .any(|bytes| bytes == b"SYNTHETIC_RESPONSE_MARKER")
+    );
+    Ok(())
+}
+
+#[test]
+fn claude_rescan_merges_replayed_messages_and_adds_one_new_event() -> anyhow::Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let project = fixture.path().join("projects/project");
+    let subagents = project.join("session/subagents");
+    fs::create_dir_all(&subagents)?;
+    let session = project.join("session.jsonl");
+    fs::write(
+        &session,
+        r#"{"type":"assistant","timestamp":"2025-06-01T12:00:00Z","uuid":"entry-1","requestId":"req_1","message":{"id":"msg_1","model":"claude-sonnet","usage":{"input_tokens":40,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2025-06-01T12:00:01Z","uuid":"entry-2","requestId":"req_1","message":{"id":"msg_1","model":"claude-sonnet","usage":{"input_tokens":40,"output_tokens":12}}}
+"#,
+    )?;
+    fs::copy(&session, subagents.join("agent.jsonl"))?;
+    let database = fixture.path().join("edith.sqlite");
+    let store = UsageStore::new(database.clone());
+    let totals = |store: &UsageStore| -> anyhow::Result<_> {
+        let events = store.saved()?;
+        Ok((
+            events.len(),
+            events.iter().map(|event| event.input).sum::<i64>(),
+            events.iter().map(|event| event.output).sum::<i64>(),
+        ))
+    };
+    for _ in 0..2 {
+        store.scan_claude(fixture.path())?;
+        assert_eq!(totals(&store)?, (1, 40, 12));
+    }
+
+    let mut log = fs::OpenOptions::new().append(true).open(&session)?;
+    write!(
+        log,
+        "{}",
+        r#"{"type":"assistant","timestamp":"2025-06-01T13:00:00Z","uuid":"entry-3","requestId":"req_2","message":{"id":"msg_2","model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":4}}}"#,
+    )?;
+    store.scan_claude(fixture.path())?;
+    assert_eq!(totals(&store)?, (1, 40, 12));
+    writeln!(log)?;
+    drop(log);
+    let reopened = UsageStore::new(database);
+    for _ in 0..2 {
+        reopened.scan_claude(fixture.path())?;
+        assert_eq!(totals(&reopened)?, (2, 50, 16));
+    }
+    fs::remove_dir_all(fixture.path().join("projects"))?;
+    reopened.scan_claude(fixture.path())?;
+    assert_eq!(totals(&reopened)?, (2, 50, 16));
+    Ok(())
+}

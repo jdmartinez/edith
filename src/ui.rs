@@ -364,7 +364,7 @@ impl Workspace {
                             cx.notify();
                         }),
                     ))
-                    .child(div().text_lg().child("Historial de Codex"))
+                    .child(div().text_lg().child("Historial de uso local"))
                     .child(
                         div()
                             .flex_1()
@@ -389,7 +389,7 @@ impl Workspace {
             )
             .child(
                 div()
-                    .id("codex-usage-history")
+                    .id("usage-history")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
