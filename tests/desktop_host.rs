@@ -6,6 +6,7 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::PathBuf,
     process::{Child, Command},
+    sync::atomic::{AtomicUsize, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -49,11 +50,16 @@ fn copilot_uses_its_own_executable_and_keeps_its_identity() {
 }
 
 fn start_host() -> Host {
+    static NEXT_HOST: AtomicUsize = AtomicUsize::new(0);
+    let index = NEXT_HOST.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let state = PathBuf::from(format!("/tmp/edith-test-{}-{nonce:x}", std::process::id()));
+    let state = PathBuf::from(format!(
+        "/tmp/edith-test-{}-{nonce:x}-{index}",
+        std::process::id()
+    ));
     fs::create_dir(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_edith-gpui-prototype"))
@@ -272,4 +278,131 @@ fn scanning_only_adds_selected_clones_and_preserves_running_sessions() {
         before["State"]["panes"][0]["pid"]
     );
     assert_eq!(after["State"]["panes"][0]["exited"], false);
+}
+
+#[test]
+fn sessions_keep_their_checkout_when_opening_or_creating_worktrees() {
+    let host = start_host();
+    let repo = host.state.join("project");
+    let git = |directory: &std::path::Path, args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(directory)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    fs::create_dir(&repo).unwrap();
+    let repo = repo.canonicalize().unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "base",
+            "--allow-empty",
+        ],
+    );
+    git(&repo, &["branch", "free"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "main only",
+            "--allow-empty",
+        ],
+    );
+    let existing = repo.parent().unwrap().join("existing worktree");
+    let program = host.state.join("codex");
+    fs::write(
+        &program,
+        "#!/bin/sh\nread line\nprintf 'CHECKOUT=%s\\n' \"$(git branch --show-current)\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(host.request(json!({"AddProject": repo})), "Ok");
+    git(
+        &repo,
+        &["worktree", "add", "-qb", "busy", "../existing worktree"],
+    );
+
+    let start = |target: Value| {
+        host.request(json!({"StartSession": {
+            "project": repo, "agent": "Codex", "target": target
+        }}))
+    };
+    let options = host.request(json!({"SessionDirectories": repo}));
+    assert_eq!(options["Directories"]["worktrees"], json!([existing]));
+    let branches = options["Directories"]["branches"].as_array().unwrap();
+    assert!(branches.contains(&json!({"name":"busy","occupied":existing})));
+    assert!(branches.contains(&json!({"name":"free","occupied":null})));
+
+    assert_eq!(start(json!("Main")), "Ok");
+    assert_eq!(
+        start(json!({"Branch":"busy"})),
+        json!({"BranchOccupied":existing})
+    );
+    assert!(start(json!({"Existing":host.state}))["Error"].is_string());
+    assert_eq!(start(json!({"Existing":existing})), "Ok");
+    assert_eq!(start(json!({"Branch":"free"})), "Ok");
+    assert_eq!(
+        start(json!({"NewBranch":{"name":"feature/new","base":"free"}})),
+        "Ok"
+    );
+
+    let state = host.request(json!({"Poll":[]}));
+    let panes = state["State"]["panes"].as_array().unwrap();
+    assert_eq!(panes.len(), 4);
+    assert_eq!(panes[0]["directory"], json!(repo));
+    assert_eq!(panes[1]["directory"], json!(existing));
+    let worktrees = state["State"]["worktrees"][repo.to_str().unwrap()]
+        .as_array()
+        .unwrap();
+    assert_eq!(worktrees.len(), 3);
+    for pane in &panes[1..] {
+        assert!(worktrees.contains(&pane["directory"]));
+    }
+    assert_eq!(
+        state["State"]["terminal_projects"],
+        json!([repo, repo, repo, repo])
+    );
+    for (pane, branch) in panes.iter().zip(["main", "busy", "free", "feature/new"]) {
+        let path = std::path::Path::new(pane["directory"].as_str().unwrap());
+        assert_eq!(git(path, &["branch", "--show-current"]), branch);
+    }
+    assert_eq!(
+        git(&repo, &["rev-parse", "free"]),
+        git(&repo, &["rev-parse", "feature/new"])
+    );
+    assert_ne!(
+        git(&repo, &["rev-parse", "main"]),
+        git(&repo, &["rev-parse", "feature/new"])
+    );
+
+    assert_eq!(host.request(json!({"Input":{"pane":0,"bytes":[10]}})), "Ok");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = host.request(json!({"Poll":[]}));
+        let pane = &state["State"]["panes"][0];
+        if pane["exited"] == true && pane["lines"].to_string().contains("CHECKOUT=main") {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
 }
