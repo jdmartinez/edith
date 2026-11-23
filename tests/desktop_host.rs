@@ -886,3 +886,53 @@ esac
     assert_eq!(retried["panes"][0]["pid"], recovered["panes"][0]["pid"]);
     assert_eq!(retried["panes"][1]["pid"], recovered["panes"][1]["pid"]);
 }
+
+#[test]
+fn closed_session_cleanup_preserves_live_panes_and_honors_persisted_policy() {
+    let (mut host, repo) = panel_host();
+    let marker = repo.join("retained");
+    fs::write(&marker, "keep").unwrap();
+    let poll = || json!({"Poll": []});
+    assert_eq!(host.request(poll())["State"]["retention_days"], 30);
+    for _ in 0..3 {
+        assert_eq!(
+            host.request(json!({"StartSession": {"agent": "Codex", "project": repo}})),
+            "Ok"
+        );
+    }
+    assert!(
+        host.request(json!({"ForgetClosedSession": 2}))
+            .get("Error")
+            .is_some()
+    );
+    assert_eq!(host.request(json!({"Panel": {"Close": {"pane": 2}}})), "Ok");
+    assert_eq!(host.request(json!({"ForgetClosedSession": 2})), "Ok");
+    let state = host.request(poll());
+    assert_eq!(state["State"]["terminal_projects"][2], "");
+    assert_eq!(state["State"]["panes"][2]["lines"], json!([]));
+    assert!(
+        host.request(json!({"Panel": {"Show": {"pane": 2}}}))
+            .get("Error")
+            .is_some()
+    );
+    assert_eq!(host.request(json!({"Panel": {"Show": {"pane": 0}}})), "Ok");
+    assert_eq!(host.request(json!({"Panel": {"Close": {"pane": 0}}})), "Ok");
+    assert_eq!(host.request(json!({"SetRetentionDays": null})), "Ok");
+
+    let manifest_path = host.state.join("workspace.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["sessions"][0]["closed_at"] = json!(1);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    host.restart();
+    let state = host.request(poll());
+    assert!(state["State"]["retention_days"].is_null());
+    assert_ne!(state["State"]["terminal_projects"][0], "");
+
+    assert_eq!(host.request(json!({"SetRetentionDays": 7})), "Ok");
+    let state = host.request(poll());
+    assert_eq!(state["State"]["retention_days"], 7);
+    assert_eq!(state["State"]["terminal_projects"][0], "");
+    assert_ne!(state["State"]["terminal_projects"][1], "");
+    assert_eq!(state["State"]["panes"][0]["lines"], json!([]));
+    assert_eq!(fs::read_to_string(marker).unwrap(), "keep");
+}

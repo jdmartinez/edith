@@ -34,6 +34,7 @@ pub(super) struct Workspace {
     usage: UsagePanel,
     sessions: Sessions,
     terminal_projects: Vec<PathBuf>,
+    retention_days: Option<u32>,
     project_dir: String,
     connected: bool,
     layout: Layout,
@@ -86,6 +87,7 @@ impl Workspace {
             usage: UsagePanel::default(),
             sessions: Sessions::new(cx.focus_handle()),
             terminal_projects: Vec::new(),
+            retention_days: Some(30),
             project_dir: String::new(),
             connected: false,
             layout: Layout::default(),
@@ -115,6 +117,7 @@ impl Workspace {
                     worktrees,
                     agent_executables,
                     terminal_projects,
+                    retention_days,
                 }) => {
                     if self.desktop {
                         self.panels_supported = desktop_layout.is_some();
@@ -133,6 +136,7 @@ impl Workspace {
                     self.sessions
                         .update_projects(projects, worktrees, agent_executables);
                     self.terminal_projects = terminal_projects;
+                    self.retention_days = retention_days;
                     self.panes.resize_with(panes.len(), Snapshot::default);
                     self.sizes.resize(panes.len(), (0, 0));
                     if self.active >= panes.len() {

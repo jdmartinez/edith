@@ -70,8 +70,68 @@ impl Workspace {
                     .overflow_y_scroll()
                     .child(self.usage_filters(cx))
                     .child(self.usage.content())
-                    .child(self.usage.billing_content(self.billing_button(cx))),
+                    .child(self.usage.billing_content(self.billing_button(cx)))
+                    .child(self.usage_retention_controls(cx)),
             )
+    }
+
+    fn usage_retention_controls(&self, cx: &Context<Self>) -> Div {
+        let mut controls = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .child("Borrar estadísticas locales");
+        if self.usage.scanning() {
+            return controls;
+        }
+        if let Some(agent) = self.usage.erase_selection {
+            return controls
+                .child(format!(
+                    "¿Borrar permanentemente las estadísticas de {}?",
+                    agent.map_or("todos los agentes", agent_name)
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(button("Confirmar borrado").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, _, _, cx| {
+                                view.usage.erase(agent);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(button("Cancelar").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| {
+                                view.usage.erase_selection = None;
+                                cx.notify();
+                            }),
+                        )),
+                );
+        }
+        controls = controls.child(
+            div().flex().flex_wrap().gap_2().children(
+                [
+                    None,
+                    Some(UsageAgent::Codex),
+                    Some(UsageAgent::Claude),
+                    Some(UsageAgent::Copilot),
+                ]
+                .into_iter()
+                .map(|agent| {
+                    button(agent.map_or("Todos los agentes", agent_name)).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.usage.erase_selection = Some(agent);
+                            cx.notify();
+                        }),
+                    )
+                }),
+            ),
+        );
+        controls
     }
 
     fn billing_button(&self, cx: &Context<Self>) -> Div {
