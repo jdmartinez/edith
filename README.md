@@ -16,3 +16,9 @@ cargo run --locked
 `cargo run --locked -- --status` consulta el host y `cargo run --locked -- --stop-host` lo detiene junto con sus sesiones. Los proyectos y las rutas elegidas se conservan mientras viva el host. Puedes indicar un directorio de estado privado y aislado con `EDITH_PROTOTYPE_STATE`.
 
 El prototipo del ticket 1 sigue accesible con `--prototype` para tres shells y con `--agents` para Claude Code, Codex y Copilot CLI. Usa un directorio de estado distinto al del escritorio. Consulta la [validación del prototipo](docs/ticket-1-validation.md).
+
+## Estadísticas locales de Copilot
+
+Edith busca registros `session.usage_record` en `~/.copilot/session-state/<sesión>/events.jsonl` o en la ubicación definida por `COPILOT_HOME`. Guarda los contadores de tokens y el tiempo de API que aparecen en cada registro. En el panel, `0` indica un cero registrado, `Sin datos` indica un contador ausente y `parcial` identifica un total calculado con registros incompletos. [Directorio de configuración de Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference)
+
+El formato se comprobó en registros nativos de `copilot-agent` en macOS. La cobertura de instalaciones independientes de Copilot CLI en macOS y Windows está pendiente de verificación.
