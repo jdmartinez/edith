@@ -9,7 +9,9 @@ cargo run --locked
 1. Pulsa **Añadir repositorio** y selecciona una carpeta dentro del repositorio. Para añadir varios proyectos, pulsa **Escanear carpeta…**, elige la carpeta contenedora, marca los clones que quieras ver y pulsa **Añadir seleccionados**. Cada clon local tiene su propio proyecto y muestra sus worktrees debajo.
 2. Pulsa **Nueva sesión** en el proyecto y elige un agente. Edith busca el ejecutable en `PATH` y en ubicaciones habituales de instalación. En **Ejecutables de agentes**, usa **Elegir ejecutable** junto al agente correspondiente para dar prioridad a otra instalación, o **Usar detección automática** para restablecer la búsqueda. Cada agente hereda el entorno del usuario y usa su configuración y autenticación habituales.
 3. Selecciona una sesión desde la barra lateral o su pestaña para enviarle el teclado. El control en la cabecera permite ocultar y volver a mostrar la barra lateral.
-4. Cierra y vuelve a abrir la ventana para recuperar las sesiones, incluidos el estado y la última pantalla disponible de las que terminaron.
+4. En el menú **Panel**, elige **Dividir a la derecha** o **Dividir debajo**. Abre una sesión o selecciona una oculta para llenar el espacio libre. Arrastra el separador para ajustar los tamaños.
+5. En el mismo menú, **Ocultar sesión** retira el panel y mantiene el agente activo. La barra lateral marca la sesión como **Oculta** y permite restaurarla. **Cerrar sesión** retira el panel y detiene el agente.
+6. Cierra y vuelve a abrir la ventana para recuperar la disposición, los tamaños y las sesiones desde el host.
 
 `cargo run --locked -- --status` consulta el host y `cargo run --locked -- --stop-host` lo detiene junto con sus sesiones. Los proyectos y las rutas elegidas se conservan mientras viva el host. Puedes indicar un directorio de estado privado y aislado con `EDITH_PROTOTYPE_STATE`.
 
