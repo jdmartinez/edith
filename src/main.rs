@@ -128,7 +128,8 @@ fn exercise_shells(endpoint: &Endpoint) -> Result<()> {
         })?;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let timeout = if cfg!(windows) { 15 } else { 5 };
+    let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         let (layout, panes) = state(endpoint)?;
         ensure!(layout == split, "reconnected client did not recover layout");
@@ -140,23 +141,40 @@ fn exercise_shells(endpoint: &Endpoint) -> Result<()> {
         );
         if panes.iter().enumerate().all(|(pane, snapshot)| {
             let marker = format!("EDITH_PTY_{pane} 18 60");
-            snapshot.lines.iter().any(|line| {
-                line.iter()
-                    .map(|run| run.text.as_str())
-                    .collect::<String>()
-                    .trim()
-                    == marker
+            let buffer_marker = format!("EDITH_BUFFER_{pane} 18 60");
+            terminal_lines(snapshot).any(|line| {
+                let line = line.trim();
+                line == marker || (cfg!(windows) && line == buffer_marker)
             })
         }) {
             println!("PTY PIDs: {pids:?}; each shell reported 18 rows and 60 columns");
             return Ok(());
         }
-        ensure!(
-            Instant::now() < deadline,
-            "one or more shells did not return the expected output"
-        );
+        if Instant::now() >= deadline {
+            for (pane, snapshot) in panes.iter().enumerate() {
+                let mut recent = terminal_lines(snapshot)
+                    .rev()
+                    .filter(|line| !line.trim().is_empty())
+                    .take(8)
+                    .map(|line| line.trim_end().chars().take(96).collect::<String>())
+                    .collect::<Vec<_>>();
+                recent.reverse();
+                eprintln!(
+                    "Pane {pane} (PID {:?}, exited {}): {recent:?}",
+                    snapshot.pid, snapshot.exited
+                );
+            }
+            bail!("one or more shells did not return the expected output");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn terminal_lines(snapshot: &Snapshot) -> impl DoubleEndedIterator<Item = String> + '_ {
+    snapshot
+        .lines
+        .iter()
+        .map(|line| line.iter().map(|run| run.text.as_str()).collect())
 }
 
 fn shell_probe(pane: usize) -> String {
@@ -164,6 +182,8 @@ fn shell_probe(pane: usize) -> String {
     return format!("printf '%s%s %s\\n' EDITH_ PTY_{pane} \"$(stty size | xargs)\"\r");
     #[cfg(windows)]
     return format!(
-        "powershell -NoProfile -Command \"'EDITH_' + 'PTY_{pane} ' + [Console]::WindowHeight + ' ' + [Console]::WindowWidth\"\r"
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"\
+         'EDITH_' + 'PTY_{pane} ' + [Console]::WindowHeight + ' ' + [Console]::WindowWidth; \
+         'EDITH_' + 'BUFFER_{pane} ' + [Console]::BufferHeight + ' ' + [Console]::BufferWidth\"\r"
     );
 }

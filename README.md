@@ -21,4 +21,4 @@ El prototipo del ticket 1 sigue accesible con `--prototype` para tres shells y c
 
 Edith busca registros `session.usage_record` en `~/.copilot/session-state/<sesión>/events.jsonl` o en la ubicación definida por `COPILOT_HOME`. Guarda los contadores de tokens y el tiempo de API que aparecen en cada registro. En el panel, `0` indica un cero registrado, `Sin datos` indica un contador ausente y `parcial` identifica un total calculado con registros incompletos. [Directorio de configuración de Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference)
 
-El formato se comprobó en registros nativos de `copilot-agent` en macOS. La cobertura de instalaciones independientes de Copilot CLI en macOS y Windows está pendiente de verificación.
+El formato se comprobó con Copilot CLI 1.0.114 en macOS y Windows. La prueba usa un proveedor simulado en localhost y comprueba los contadores del registro, incluidos los ceros medidos. [Validación nativa](.github/workflows/native-validation.yml)

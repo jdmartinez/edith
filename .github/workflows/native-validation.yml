@@ -1,0 +1,48 @@
+name: Native validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-terminal:
+    name: Windows terminal and GPUI build
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: cargo test --locked --no-default-features
+      - run: cargo build --locked
+      - if: ${{ !cancelled() }}
+        run: cargo run --locked --no-default-features -- --smoke-test
+
+  copilot-cli:
+    name: Copilot CLI event log (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/edith-copilot" --no-audit --no-fund @github/copilot@1.0.114
+          loader="$RUNNER_TEMP/edith-copilot/node_modules/@github/copilot/npm-loader.js"
+          node "$loader" --version
+          python tests/copilot_native.py node "$loader"
