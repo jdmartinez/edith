@@ -94,6 +94,8 @@ pub(super) struct Terminal {
     directory: PathBuf,
     screen: Arc<Mutex<Screen>>,
     exited: bool,
+    resume_backup: Option<Snapshot>,
+    resume_error: Option<String>,
 }
 
 impl Terminal {
@@ -106,6 +108,16 @@ impl Terminal {
     }
 
     pub(super) fn new(program: &std::ffi::OsStr, agent: bool, cwd: &Path) -> Result<Self> {
+        Self::launch(program, agent, cwd, &[], 1)
+    }
+
+    pub(super) fn launch(
+        program: &OsStr,
+        agent: bool,
+        cwd: &Path,
+        args: &[&str],
+        revision: u64,
+    ) -> Result<Self> {
         let rows = 24;
         let cols = 80;
         let pair = native_pty_system().openpty(pty_size(rows, cols))?;
@@ -137,6 +149,7 @@ impl Terminal {
         } else {
             CommandBuilder::new(program)
         };
+        command.args(args);
         command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         let child = pair
@@ -149,7 +162,7 @@ impl Terminal {
         let writer = pair.master.take_writer()?;
         let screen = Arc::new(Mutex::new(Screen {
             parser: vt100::Parser::new(rows, cols, 512),
-            revision: 1,
+            revision,
         }));
         let screen_reader = Arc::clone(&screen);
         thread::spawn(move || {
@@ -173,7 +186,14 @@ impl Terminal {
             directory: cwd.into(),
             screen,
             exited: false,
+            resume_backup: None,
+            resume_error: None,
         })
+    }
+
+    pub(super) fn retain_on_resume_failure(&mut self, mut previous: Snapshot) {
+        previous.resume_error = None;
+        self.resume_backup = Some(previous);
     }
 
     pub(super) fn close(&mut self) -> Result<Snapshot> {
@@ -212,14 +232,33 @@ impl Terminal {
     }
 
     pub(super) fn snapshot(&mut self, seen: u64) -> Result<Option<Snapshot>> {
-        let exited_now = !self.exited && self.child.try_wait()?.is_some();
+        let exit = if self.exited {
+            None
+        } else {
+            self.child.try_wait()?
+        };
         let mut state = self.screen.lock().unwrap();
-        if exited_now {
+        if let Some(exit) = exit {
             self.exited = true;
             state.revision += 1;
+            if exit.success() {
+                self.resume_backup = None;
+            } else if self.resume_backup.is_some() {
+                self.resume_error =
+                    Some(format!("El agente terminó al reanudar la sesión ({exit})."));
+            }
         }
         if state.revision <= seen {
             return Ok(None);
+        }
+        if let Some(error) = &self.resume_error
+            && let Some(previous) = &self.resume_backup
+        {
+            return Ok(Some(Snapshot {
+                revision: state.revision,
+                resume_error: Some(error.clone()),
+                ..previous.clone()
+            }));
         }
         let screen = state.parser.screen();
         let (rows, cols) = screen.size();
@@ -273,6 +312,8 @@ impl Terminal {
             pid: self.pid,
             exited: self.exited,
             closed_by_user: false,
+            can_resume: false,
+            resume_error: None,
             application_cursor: screen.application_cursor(),
             bracketed_paste: screen.bracketed_paste(),
             lines,

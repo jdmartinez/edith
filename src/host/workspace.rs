@@ -20,6 +20,7 @@ pub(super) struct WorkspaceState {
     agent_executables: BTreeMap<Agent, PathBuf>,
     terminal_projects: Vec<PathBuf>,
     worktree_removal: Option<WorktreeRemoval>,
+    conversations: BTreeMap<usize, uuid::Uuid>,
 }
 
 impl WorkspaceState {
@@ -48,10 +49,16 @@ pub(super) fn dispatch(
             let mut panes = Vec::with_capacity(terminals.len());
             for (pane, terminal) in terminals.iter_mut().enumerate() {
                 let revision = seen.get(pane).copied().unwrap_or_default();
-                panes.push(match terminal {
+                let snapshot = match terminal {
                     Ok(terminal) => terminal.snapshot(revision)?,
                     Err(snapshot) => (snapshot.revision > revision).then(|| snapshot.clone()),
-                });
+                };
+                panes.push(snapshot.map(|mut snapshot| {
+                    snapshot.can_resume = workspace
+                        .as_ref()
+                        .is_some_and(|state| state.conversations.contains_key(&pane));
+                    snapshot
+                }));
             }
             return Ok(Reply::State {
                 layout: *layout,
@@ -233,17 +240,7 @@ pub(super) fn dispatch(
                 "Añade el repositorio antes de iniciar {}",
                 agent.name()
             );
-            let program = state
-                .agent_executables
-                .get(&agent)
-                .cloned()
-                .or_else(|| detect_agent(agent))
-                .with_context(|| {
-                    format!(
-                        "No se encontró {}. Elige su ejecutable desde la barra lateral.",
-                        agent.name()
-                    )
-                })?;
+            let program = agent_program(state, agent)?;
             let directory = match &target {
                 SessionTarget::Main => project.clone(),
                 SessionTarget::Existing(path) => {
@@ -295,22 +292,110 @@ pub(super) fn dispatch(
                     created
                 }
             };
-            let mut terminal =
-                Terminal::new(program.as_os_str(), true, &directory).with_context(|| {
-                    format!(
-                        "No se pudo iniciar {} desde {}",
-                        agent.name(),
-                        program.display()
-                    )
-                })?;
+            let pane = terminals.len();
+            let conversation = match agent {
+                Agent::Claude | Agent::Copilot => Some(uuid::Uuid::new_v4()),
+                Agent::Codex => None,
+            };
+            let identifier = conversation.map(|id| id.to_string());
+            let args = identifier.as_deref().map(|id| ["--session-id", id]);
+            let mut terminal = Terminal::launch(
+                program.as_os_str(),
+                true,
+                &directory,
+                args.as_ref().map_or(&[], |args| args.as_slice()),
+                1,
+            )
+            .with_context(|| {
+                format!(
+                    "No se pudo iniciar {} desde {}",
+                    agent.name(),
+                    program.display()
+                )
+            })?;
             terminal.set_agent(agent);
-            state.layout.assign(terminals.len());
+            if let Some(conversation) = conversation {
+                state.conversations.insert(pane, conversation);
+            }
+            state.layout.assign(pane);
             terminals.push(Ok(terminal));
             state.terminal_projects.push(project);
+        }
+        Request::ResumeSession { pane, conversation } => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            let terminal = terminals.get_mut(pane).context("Sesión desconocida")?;
+            let mut previous = match terminal {
+                Ok(terminal) => terminal
+                    .snapshot(0)?
+                    .context("Falta la salida de la terminal")?,
+                Err(snapshot) => snapshot.clone(),
+            };
+            ensure!(previous.exited, "La sesión sigue abierta");
+            let agent = previous
+                .agent
+                .context("La sesión no pertenece a un agente")?;
+            let id = if let Some(conversation) = conversation {
+                let id = uuid::Uuid::parse_str(conversation.trim())
+                    .context("Introduce un UUID de conversación válido")?;
+                ensure!(
+                    agent == Agent::Codex,
+                    "Este agente ya tiene una conversación vinculada"
+                );
+                state.conversations.insert(pane, id);
+                id
+            } else {
+                *state
+                    .conversations
+                    .get(&pane)
+                    .context("Vincula el UUID exacto de la conversación antes de reanudarla")?
+            };
+            let id = id.to_string();
+            let args = match agent {
+                Agent::Codex => ["resume", id.as_str()],
+                Agent::Claude | Agent::Copilot => ["--resume", id.as_str()],
+            };
+            let revision = previous.revision + 1;
+            let next = agent_program(state, agent).and_then(|program| {
+                Terminal::launch(
+                    program.as_os_str(),
+                    true,
+                    &previous.directory,
+                    &args,
+                    revision,
+                )
+                .with_context(|| format!("No se pudo reanudar {}", agent.name()))
+            });
+            match next {
+                Ok(mut next) => {
+                    state.layout.show(pane)?;
+                    next.set_agent(agent);
+                    next.retain_on_resume_failure(previous);
+                    *terminal = Ok(next);
+                }
+                Err(error) => {
+                    previous.revision = revision;
+                    previous.resume_error = Some(format!("{error:#}"));
+                    *terminal = Err(previous);
+                }
+            }
         }
         Request::Stop => {}
     }
     Ok(Reply::Ok)
+}
+
+fn agent_program(state: &WorkspaceState, agent: Agent) -> Result<PathBuf> {
+    state
+        .agent_executables
+        .get(&agent)
+        .cloned()
+        .or_else(|| detect_agent(agent))
+        .with_context(|| {
+            format!(
+                "No se encontró {}. Elige su ejecutable desde la barra lateral.",
+                agent.name()
+            )
+        })
 }
 
 fn active_sessions(

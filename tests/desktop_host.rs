@@ -677,3 +677,80 @@ fn worktree_removal_rechecks_hidden_sessions_and_allows_branch_choice() {
         false
     );
 }
+
+#[test]
+fn a_failed_resume_keeps_closed_output_and_retries_the_same_conversation() {
+    let host = start_host();
+    let repo = host.state.join("project");
+    fs::create_dir(&repo).unwrap();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let repo = repo.canonicalize().unwrap();
+    let executable = host.state.join("claude-fixture");
+    fs::write(
+        &executable,
+        "#!/bin/sh\ncase \"$1\" in\n--session-id) printf '%s\\n' \"$2\" > conversation; echo CLOSED_OUTPUT; read line;;\n--resume) test \"$2\" = \"$(cat conversation)\" || exit 7; test -f resume-enabled || exit 8; echo RESUMED_OUTPUT; read line;;\n*) exit 9;;\nesac\n",
+    ).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(host.request(json!({"AddProject": repo})), "Ok");
+    assert_eq!(
+        host.request(json!({"SetAgentExecutable": {"agent": "Claude", "path": executable}})),
+        "Ok"
+    );
+    assert_eq!(
+        host.request(json!({"StartSession": {"agent": "Claude", "project": repo}})),
+        "Ok"
+    );
+
+    let await_pane = |predicate: &dyn Fn(&Value) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = host.request(json!({"Poll": []}));
+            let pane = &state["State"]["panes"][0];
+            if predicate(pane) {
+                return pane.clone();
+            }
+            assert!(Instant::now() < deadline, "{pane}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let before = await_pane(&|pane| pane["lines"].to_string().contains("CLOSED_OUTPUT"));
+    assert_eq!(before["can_resume"], true);
+    assert!(
+        uuid::Uuid::parse_str(
+            fs::read_to_string(repo.join("conversation"))
+                .unwrap()
+                .trim()
+        )
+        .is_ok()
+    );
+    panel_action(&host, json!({"Close": {"pane": 0}}));
+    let closed = await_pane(&|pane| pane["exited"] == true);
+    let resume = || host.request(json!({"ResumeSession": {"pane": 0}}));
+    assert_eq!(resume(), "Ok");
+    let failed = await_pane(&|pane| pane["resume_error"].is_string());
+    assert_eq!(failed["exited"], true);
+    assert!(failed["lines"].to_string().contains("CLOSED_OUTPUT"));
+    assert!(failed["revision"].as_u64() > closed["revision"].as_u64());
+
+    fs::write(repo.join("resume-enabled"), "").unwrap();
+    assert_eq!(resume(), "Ok");
+    let resumed = await_pane(&|pane| pane["lines"].to_string().contains("RESUMED_OUTPUT"));
+    assert_eq!(resumed["agent"], "Claude");
+    assert_eq!(resumed["exited"], false);
+    assert!(resumed["resume_error"].is_null());
+    assert!(resumed["revision"].as_u64() > failed["revision"].as_u64());
+    assert_ne!(before["pid"], resumed["pid"]);
+    assert_eq!(
+        host.request(json!({"Poll": []}))["State"]["desktop_layout"]["root"],
+        json!({"Pane": 0})
+    );
+}
