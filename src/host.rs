@@ -100,6 +100,16 @@ pub enum Request {
         path: Option<PathBuf>,
     },
     SessionDirectories(PathBuf),
+    InspectWorktreeRemoval {
+        project: PathBuf,
+        path: PathBuf,
+    },
+    RemoveWorktree {
+        project: PathBuf,
+        path: PathBuf,
+        force: bool,
+        delete_branch: bool,
+    },
     StartSession {
         project: PathBuf,
         agent: Agent,
@@ -145,6 +155,17 @@ pub struct LocalBranch {
     pub occupied: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeRemoval {
+    pub project: PathBuf,
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub changes: Vec<String>,
+    pub active_sessions: Vec<usize>,
+    head: Vec<u8>,
+    git_dir: Vec<u8>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     State {
@@ -165,6 +186,10 @@ pub enum Reply {
     },
     Discovered(Vec<Repository>),
     Directories(SessionDirectories),
+    WorktreeRemoval(WorktreeRemoval),
+    WorktreeRemoved {
+        retained_branch: Option<String>,
+    },
     BranchOccupied(PathBuf),
     SessionStarted,
     Ok,
@@ -384,6 +409,7 @@ struct WorkspaceState {
     projects: Vec<Repository>,
     agent_executables: BTreeMap<Agent, PathBuf>,
     terminal_projects: Vec<PathBuf>,
+    worktree_removal: Option<WorktreeRemoval>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -398,6 +424,7 @@ fn git(path: &Path, args: &[impl AsRef<OsStr>]) -> Result<Vec<u8>> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
         .current_dir(path)
         .output()
         .context("No se pudo ejecutar Git")?;
@@ -455,6 +482,83 @@ fn checkouts(project: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
         }
     }
     Ok(checkouts)
+}
+
+fn inspect_worktree_removal(
+    project: &Path,
+    path: &Path,
+    terminals: &mut [Result<Terminal, Snapshot>],
+) -> Result<WorktreeRemoval> {
+    let path = path.canonicalize()?;
+    let mut registered = checkouts(project)?.into_iter();
+    let (main, _) = registered.next().context("Falta el directorio principal")?;
+    ensure!(
+        main == project && path != main,
+        "El directorio principal no se puede retirar"
+    );
+    let (_, branch) = registered
+        .find(|(checkout, _)| *checkout == path)
+        .context("El directorio no es un worktree de este proyecto")?;
+    let common_dir = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    ensure!(
+        git(project, &common_dir)? == git(&path, &common_dir)?,
+        "El directorio ya no pertenece a este repositorio"
+    );
+    let git_dir = git(&path, &["rev-parse", "--absolute-git-dir"])?;
+    let head = git(&path, &["rev-parse", "--verify", "HEAD"])?;
+    // Porcelain quotes unusual paths and emits one entry per line.
+    // Ignored files can also be lost when Git removes the directory.
+    let status = git(
+        &path,
+        &[
+            "-c",
+            "core.quotePath=true",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ],
+    )?;
+    let mut active_sessions = Vec::new();
+    for (index, terminal) in terminals.iter_mut().enumerate() {
+        if let Ok(terminal) = terminal
+            && terminal.directory == path
+            && !terminal.exited
+            && terminal.child.try_wait()?.is_none()
+        {
+            active_sessions.push(index);
+        }
+    }
+    Ok(WorktreeRemoval {
+        project: project.into(),
+        path,
+        branch,
+        changes: String::from_utf8_lossy(&status)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        active_sessions,
+        head,
+        git_dir,
+    })
+}
+
+fn delete_integrated_branch(removal: &WorktreeRemoval, branch: &str) -> Result<()> {
+    let project = &removal.project;
+    let reference = format!("refs/heads/{branch}");
+    ensure!(
+        git(project, &["rev-parse", "--verify", &reference])? == removal.head,
+        "La rama ha cambiado"
+    );
+    // Check the principal checkout even when the branch has an upstream.
+    git(
+        project,
+        &["merge-base", "--is-ancestor", &reference, "HEAD"],
+    )?;
+    git(project, &["branch", "-d", "--", branch])?;
+    Ok(())
 }
 
 fn session_directories(project: &Path) -> Result<SessionDirectories> {
@@ -710,6 +814,59 @@ fn dispatch(
             let directories = session_directories(&project)?;
             added.worktrees.clone_from(&directories.worktrees);
             return Ok(Reply::Directories(directories));
+        }
+        Request::InspectWorktreeRemoval { project, path } => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            state.worktree_removal = None;
+            ensure!(
+                state.projects.iter().any(|item| item.root == project),
+                "Añade el repositorio primero"
+            );
+            let preview = inspect_worktree_removal(&project, &path, terminals)?;
+            state.worktree_removal = Some(preview.clone());
+            return Ok(Reply::WorktreeRemoval(preview));
+        }
+        Request::RemoveWorktree {
+            project,
+            path,
+            force,
+            delete_branch,
+        } => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            let reviewed = state
+                .worktree_removal
+                .take()
+                .context("Revisa el worktree antes de retirarlo")?;
+            ensure!(
+                reviewed.project == project && reviewed.path == path,
+                "Revisa este worktree antes de retirarlo"
+            );
+            let current = inspect_worktree_removal(&project, &path, terminals)?;
+            if current != reviewed
+                || !current.active_sessions.is_empty()
+                || force == current.changes.is_empty()
+            {
+                state.worktree_removal = Some(current.clone());
+                return Ok(Reply::WorktreeRemoval(current));
+            }
+
+            let mut arguments = vec![OsStr::new("worktree"), OsStr::new("remove")];
+            if force {
+                arguments.push(OsStr::new("--force"));
+            }
+            arguments.extend([OsStr::new("--"), current.path.as_os_str()]);
+            git(&project, &arguments)?;
+            if let Some(added) = state.projects.iter_mut().find(|item| item.root == project) {
+                added.worktrees.retain(|checkout| *checkout != path);
+            }
+            let retained_branch = current
+                .branch
+                .as_ref()
+                .filter(|branch| {
+                    delete_branch && delete_integrated_branch(&current, branch).is_err()
+                })
+                .cloned();
+            return Ok(Reply::WorktreeRemoved { retained_branch });
         }
         Request::StartSession {
             project,
