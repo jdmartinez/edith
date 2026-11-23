@@ -7,15 +7,18 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::DateTime;
 use gpui::{Div, div, prelude::*, px, rgb};
 
 use crate::usage::{UsageAgent, UsageEvent, UsageStore};
 
 mod analytics;
 mod charts;
+mod pricing;
 
-use analytics::{Metric, Summary, Totals, summarize};
+use analytics::{Metric, Summary, Totals, selected, summarize};
 use charts::{daily_chart, heatmap};
+use pricing::{BillingReport, CURRENT_RATE_DATE, Estimate, EstimatedAmount, format_money};
 
 type History = Result<Vec<UsageEvent>>;
 
@@ -74,6 +77,9 @@ pub struct UsagePanel {
     events: Vec<UsageEvent>,
     pub(crate) filters: Filters,
     message: &'static str,
+    billing_report: Option<BillingReport>,
+    billing_error: bool,
+    billing_updates: Option<Receiver<Result<BillingReport>>>,
 }
 
 impl UsagePanel {
@@ -116,7 +122,7 @@ impl UsagePanel {
     }
 
     pub fn refresh(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.refresh_billing();
         while let Some(updates) = &self.updates {
             match updates.try_recv() {
                 Ok(Update::Saved(events)) => self.events = events,
@@ -148,6 +154,19 @@ impl UsagePanel {
         changed
     }
 
+    fn refresh_billing(&mut self) -> bool {
+        let Some(updates) = &self.billing_updates else {
+            return false;
+        };
+        match updates.try_recv() {
+            Ok(Ok(report)) => self.billing_report = Some(report),
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => self.billing_error = true,
+            Err(TryRecvError::Empty) => return false,
+        }
+        self.billing_updates = None;
+        true
+    }
+
     pub fn status(&self) -> &'static str {
         if self.scanning() {
             "Escaneando historial local…"
@@ -161,6 +180,69 @@ impl UsagePanel {
             .iter()
             .map(|event| event.model.as_str())
             .collect()
+    }
+
+    pub(crate) fn load_billing_report(&mut self, path: PathBuf) {
+        if self.loading_billing() {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        self.billing_updates = Some(receive);
+        self.billing_error = false;
+        thread::spawn(move || {
+            let result = std::fs::read(path)
+                .map_err(Into::into)
+                .and_then(|bytes| pricing::parse_billing_report(&bytes));
+            let _ = send.send(result);
+        });
+    }
+
+    pub(crate) fn loading_billing(&self) -> bool {
+        self.billing_updates.is_some()
+    }
+
+    pub(crate) fn billing_content(&self, import_button: Div) -> Div {
+        let mut panel = card()
+            .mx_6()
+            .mb_6()
+            .child(
+                div()
+                    .text_lg()
+                    .child("Importes informados por el proveedor"),
+            )
+            .child(div().text_sm().text_color(rgb(0xaab8cc)).child(
+                "Informe de cuenta u organización, independiente de los filtros de uso local.",
+            ))
+            .child(import_button);
+        if self.billing_error {
+            panel = panel.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xf0b687))
+                    .child("No se pudo abrir el informe. Elige un JSON de OpenAI Costs o Anthropic Cost Analytics con importes."),
+            );
+        }
+        if let Some(report) = &self.billing_report {
+            let date = |timestamp| {
+                DateTime::from_timestamp(timestamp, 0).map_or_else(String::new, |date| {
+                    date.format("%d/%m/%Y %H:%M").to_string()
+                })
+            };
+            panel = panel
+                .child(format!(
+                    "{} · {} a {} UTC (fin excluido)",
+                    report.provider,
+                    date(report.start),
+                    date(report.end_exclusive),
+                ))
+                .when(report.has_more, |panel| {
+                    panel.child("Página parcial. El proveedor indica que quedan resultados.")
+                })
+                .children(report.amounts.iter().map(|(currency, amount)| {
+                    div().child(format!("{} {currency}", format_money(*amount)))
+                }));
+        }
+        panel
     }
 
     pub fn content(&self) -> Div {
@@ -181,8 +263,39 @@ impl UsagePanel {
                     "Sin métricas para esta selección."
                 });
         }
-        summary.content(self.filters.period.first_day(current_day), current_day)
+        let estimate = pricing::summarize(
+            selected(&self.events, &self.filters, current_day).map(|(event, _)| event),
+        );
+        summary
+            .content(self.filters.period.first_day(current_day), current_day)
+            .child(cost_estimate(&estimate))
     }
+}
+
+fn cost_estimate(estimate: &Estimate) -> Div {
+    let amount = |title: String, amount: &EstimatedAmount| {
+        let label = if amount.events == 0 {
+            amount.label()
+        } else {
+            format!("{} USD · {} registros", amount.label(), amount.events)
+        };
+        div().child(format!("{title} · {label}"))
+    };
+    card()
+        .child(div().text_lg().child("Coste estimado de los tokens"))
+        .child(
+            div().text_sm().text_color(rgb(0xaab8cc))
+                .child("Tarifas estándar de API. El cálculo excluye recargos y planes que el historial local no registra."),
+        )
+        .child(amount("Tarifa histórica".into(), &estimate.historical))
+        .child(amount(
+            format!("Tarifa de referencia del {CURRENT_RATE_DATE}"),
+            &estimate.current,
+        ))
+        .child(format!(
+            "Sin estimación · {} registros",
+            estimate.unpriced_events
+        ))
 }
 
 impl Summary {
