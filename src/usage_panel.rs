@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::BTreeSet,
     env,
     path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -7,16 +7,63 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::DateTime;
 use gpui::{Div, div, prelude::*, px, rgb};
 
 use crate::usage::{UsageAgent, UsageEvent, UsageStore};
 
-type Summaries = BTreeMap<UsageAgent, Summary>;
-type History = Result<Summaries>;
+mod analytics;
+mod charts;
+
+use analytics::{Metric, Summary, Totals, summarize};
+use charts::{daily_chart, heatmap};
+
+type History = Result<Vec<UsageEvent>>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Period {
+    Week,
+    Month,
+    Quarter,
+    #[default]
+    All,
+}
+
+impl Period {
+    pub(crate) const OPTIONS: [(Self, &'static str); 4] = [
+        (Self::Week, "7 días"),
+        (Self::Month, "30 días"),
+        (Self::Quarter, "90 días"),
+        (Self::All, "Todo"),
+    ];
+
+    fn first_day(self, current_day: i64) -> Option<i64> {
+        let days = match self {
+            Self::Week => 7,
+            Self::Month => 30,
+            Self::Quarter => 90,
+            Self::All => return None,
+        };
+        Some(current_day - days + 1)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Filters {
+    pub(crate) period: Period,
+    pub(crate) agent: Option<UsageAgent>,
+    pub(crate) model: Option<String>,
+}
+
+pub(crate) fn agent_name(agent: UsageAgent) -> &'static str {
+    match agent {
+        UsageAgent::Codex => "Codex",
+        UsageAgent::Claude => "Claude Code",
+        UsageAgent::Copilot => "GitHub Copilot CLI",
+    }
+}
 
 enum Update {
-    Saved(Summaries),
+    Saved(Vec<UsageEvent>),
     Finished { history: History, incomplete: bool },
 }
 
@@ -24,7 +71,8 @@ enum Update {
 pub struct UsagePanel {
     pub open: bool,
     updates: Option<Receiver<Update>>,
-    summaries: Summaries,
+    events: Vec<UsageEvent>,
+    pub(crate) filters: Filters,
     message: &'static str,
 }
 
@@ -44,13 +92,13 @@ impl UsagePanel {
             let store = usage_database().map(UsageStore::new);
             let Ok(store) = store else {
                 let _ = send.send(Update::Finished {
-                    history: store.map(|_| Summaries::default()),
+                    history: store.map(|_| Vec::new()),
                     incomplete: true,
                 });
                 return;
             };
             if let Ok(events) = store.saved()
-                && send.send(Update::Saved(summarize(events))).is_err()
+                && send.send(Update::Saved(events)).is_err()
             {
                 return;
             }
@@ -61,7 +109,7 @@ impl UsagePanel {
                 agent_home("COPILOT_HOME", ".copilot").and_then(|home| store.scan_copilot(&home));
             let incomplete = codex.is_err() || claude.is_err() || copilot.is_err();
             let _ = send.send(Update::Finished {
-                history: store.saved().map(summarize),
+                history: store.saved(),
                 incomplete,
             });
         });
@@ -71,14 +119,14 @@ impl UsagePanel {
         let mut changed = false;
         while let Some(updates) = &self.updates {
             match updates.try_recv() {
-                Ok(Update::Saved(summary)) => self.summaries = summary,
+                Ok(Update::Saved(events)) => self.events = events,
                 Ok(Update::Finished {
                     history,
                     incomplete,
                 }) => {
                     self.message = match history {
                         Ok(history) => {
-                            self.summaries = history;
+                            self.events = history;
                             if incomplete {
                                 "El escaneo quedó incompleto. Puedes reintentarlo."
                             } else {
@@ -108,59 +156,43 @@ impl UsagePanel {
         }
     }
 
+    pub(crate) fn models(&self) -> BTreeSet<&str> {
+        self.events
+            .iter()
+            .map(|event| event.model.as_str())
+            .collect()
+    }
+
     pub fn content(&self) -> Div {
-        if self.summaries.is_empty() && self.scanning() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs() as i64);
+        let current_day = now.div_euclid(86_400);
+        let summary = summarize(&self.events, &self.filters, current_day);
+        if summary.days.is_empty() {
             return div()
                 .p_6()
                 .text_color(rgb(0xaab8cc))
-                .child("Buscando métricas locales…");
+                .child(if self.scanning() {
+                    "Buscando métricas locales…"
+                } else if self.events.is_empty() {
+                    "Sin métricas locales verificables guardadas."
+                } else {
+                    "Sin métricas para esta selección."
+                });
         }
-        div()
-            .flex()
-            .flex_col()
-            .gap_6()
-            .p_6()
-            .children(self.summaries.iter().map(|(agent, summary)| {
-                let name = match agent {
-                    UsageAgent::Codex => "Codex",
-                    UsageAgent::Claude => "Claude Code",
-                    UsageAgent::Copilot => "GitHub Copilot CLI",
-                };
-                summary.content(name, *agent)
-            }))
-            .when(
-                !self.summaries.contains_key(&UsageAgent::Copilot),
-                |panel| {
-                    panel.child(
-                        card()
-                            .child(div().text_xl().child("GitHub Copilot CLI"))
-                            .child("Sin métricas locales verificables guardadas."),
-                    )
-                },
-            )
+        summary.content(self.filters.period.first_day(current_day), current_day)
     }
 }
 
 impl Summary {
-    fn content(&self, name: &'static str, agent: UsageAgent) -> Div {
-        let Self {
-            total,
-            days,
-            models,
-        } = self;
-        let mut models = models.iter().collect::<Vec<_>>();
-        models.sort_by(|(a, first), (b, second)| {
-            second
-                .input
-                .sum
-                .cmp(&first.input.sum)
-                .then_with(|| a.cmp(b))
-        });
+    fn content(&self, first_day: Option<i64>, current_day: i64) -> Div {
+        let total = &self.total;
         div()
             .flex()
             .flex_col()
             .gap_4()
-            .child(div().text_xl().child(name))
+            .p_6()
             .child(
                 div()
                     .flex()
@@ -169,7 +201,14 @@ impl Summary {
                     .child(metric("Tokens de salida", total.output, 0xf0b687))
                     .child(metric("Entrada en caché", total.cached, 0xc4b6ff)),
             )
-            .when(agent == UsageAgent::Copilot, |panel| {
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(metric("Tareas", Metric::default(), 0x87e0cd))
+                    .child(metric("Tiempo de actividad", Metric::default(), 0xf0b687)),
+            )
+            .when(self.agents.contains_key(&UsageAgent::Copilot), |panel| {
                 panel.child(
                     div()
                         .flex()
@@ -183,19 +222,30 @@ impl Summary {
                         )),
                 )
             })
-            .child(daily_chart(days))
-            .child(
-                card()
-                    .child(div().text_lg().child("Modelos"))
-                    .child(
-                        model_row("Modelo", "Entrada".into(), "Salida".into())
-                            .text_color(rgb(0xaab8cc)),
-                    )
-                    .children(models.iter().map(|(model, tokens)| {
-                        model_row(model, tokens.input.label(), tokens.output.label())
-                    })),
-            )
+            .child(daily_chart(&self.days, first_day, current_day))
+            .child(heatmap(&self.hours))
+            .child(breakdown(
+                "Agentes",
+                self.agents
+                    .iter()
+                    .map(|(&agent, totals)| (agent_name(agent), totals)),
+            ))
+            .child(breakdown(
+                "Modelos",
+                self.models
+                    .iter()
+                    .map(|(model, totals)| (model.as_str(), totals)),
+            ))
     }
+}
+
+fn breakdown<'a>(title: &'static str, rows: impl Iterator<Item = (&'a str, &'a Totals)>) -> Div {
+    card()
+        .child(div().text_lg().child(title))
+        .child(model_row("Nombre", "Entrada".into(), "Salida".into()).text_color(rgb(0xaab8cc)))
+        .children(
+            rows.map(|(name, totals)| model_row(name, totals.input.label(), totals.output.label())),
+        )
 }
 
 fn usage_database() -> Result<PathBuf> {
@@ -216,76 +266,6 @@ fn agent_home(variable: &str, default: &str) -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("missing home directory")?
         .join(default))
-}
-
-#[derive(Default)]
-struct Summary {
-    total: Totals,
-    days: BTreeMap<i64, Totals>,
-    models: BTreeMap<String, Totals>,
-}
-
-fn summarize(events: Vec<UsageEvent>) -> Summaries {
-    let mut summaries = Summaries::new();
-    for event in events {
-        let summary = summaries.entry(event.agent).or_default();
-        summary.total.add(&event);
-        summary
-            .days
-            .entry(event.timestamp.div_euclid(86_400))
-            .or_default()
-            .add(&event);
-        summary
-            .models
-            .entry(event.model.clone())
-            .or_default()
-            .add(&event);
-    }
-    summaries
-}
-
-#[derive(Default)]
-struct Totals {
-    input: Metric,
-    cached: Metric,
-    output: Metric,
-    cache_write: Metric,
-    reasoning: Metric,
-    api_duration_ms: Metric,
-}
-
-impl Totals {
-    fn add(&mut self, event: &UsageEvent) {
-        self.input.add(event.input);
-        self.cached.add(event.cached);
-        self.output.add(event.output);
-        self.cache_write.add(event.cache_write);
-        self.reasoning.add(event.reasoning);
-        self.api_duration_ms.add(event.api_duration_ms);
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct Metric {
-    sum: Option<u64>,
-    partial: bool,
-}
-
-impl Metric {
-    fn add(&mut self, amount: Option<i64>) {
-        match amount.and_then(|amount| u64::try_from(amount).ok()) {
-            Some(amount) => self.sum = Some(self.sum.unwrap_or_default().saturating_add(amount)),
-            None => self.partial = true,
-        }
-    }
-
-    fn label(self) -> String {
-        match self.sum {
-            Some(sum) if self.partial => format!("{sum} (parcial)"),
-            Some(sum) => sum.to_string(),
-            None => "Sin datos".into(),
-        }
-    }
 }
 
 fn card() -> Div {
@@ -322,95 +302,4 @@ fn model_row(model: &str, input: String, output: String) -> Div {
         .child(div().flex_1().min_w_0().truncate().child(model.to_owned()))
         .child(div().w(px(125.0)).text_right().child(input))
         .child(div().w(px(125.0)).text_right().child(output))
-}
-
-fn daily_chart(days: &BTreeMap<i64, Totals>) -> Div {
-    let (&last, _) = days.last_key_value().unwrap();
-    let first = (*days.first_key_value().unwrap().0).max(last - 29);
-    let peak_input = days
-        .range(first..)
-        .filter_map(|(_, time)| time.input.sum)
-        .max();
-    let peak_output = days
-        .range(first..)
-        .filter_map(|(_, time)| time.output.sum)
-        .max();
-    let bars = (first..=last).map(|day| {
-        let (input, output) = days
-            .get(&day)
-            .map_or((None, None), |totals| (totals.input.sum, totals.output.sum));
-        div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .flex_col()
-            .h(px(100.0))
-            .child(
-                div().flex().flex_col().justify_end().h(px(50.0)).child(
-                    div()
-                        .w_full()
-                        .h(px(50.0 * bar_ratio(input, peak_input)))
-                        .bg(rgb(0x87e0cd)),
-                ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .h(px(50.0))
-                    .border_t_1()
-                    .border_color(rgb(0x435873))
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(49.0 * bar_ratio(output, peak_output)))
-                            .bg(rgb(0xf0b687)),
-                    ),
-            )
-    });
-    let date = |day| {
-        DateTime::from_timestamp(day * 86_400, 0)
-            .map(|date| date.format("%d/%m/%Y").to_string())
-            .unwrap_or_default()
-    };
-    card()
-        .child(div().text_lg().child("Tokens por día"))
-        .child(
-            div()
-                .flex()
-                .gap_4()
-                .text_sm()
-                .child(
-                    div()
-                        .text_color(rgb(0x87e0cd))
-                        .child(format!("Entrada · máx. {}", peak_label(peak_input))),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(0xf0b687))
-                        .child(format!("Salida · máx. {}", peak_label(peak_output))),
-                ),
-        )
-        .child(div().flex().gap_1().children(bars))
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .text_sm()
-                .text_color(rgb(0xaab8cc))
-                .child(date(first))
-                .child(if first == last {
-                    String::new()
-                } else {
-                    date(last)
-                }),
-        )
-}
-
-fn bar_ratio(amount: Option<u64>, peak: Option<u64>) -> f32 {
-    amount.unwrap_or_default() as f32 / peak.unwrap_or_default().max(1) as f32
-}
-
-fn peak_label(peak: Option<u64>) -> String {
-    peak.map_or_else(|| "Sin datos".into(), |peak| peak.to_string())
 }
