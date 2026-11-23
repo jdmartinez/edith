@@ -63,6 +63,10 @@ pub struct Snapshot {
     pub exited: bool,
     #[serde(default)]
     pub closed_by_user: bool,
+    #[serde(default)]
+    pub can_resume: bool,
+    #[serde(default)]
+    pub resume_error: Option<String>,
     pub application_cursor: bool,
     pub bracketed_paste: bool,
     pub lines: Vec<Vec<Run>>,
@@ -105,6 +109,11 @@ pub enum Request {
         agent: Agent,
         #[serde(default)]
         target: SessionTarget,
+    },
+    ResumeSession {
+        pane: usize,
+        #[serde(default)]
+        conversation: Option<String>,
     },
     Input {
         pane: usize,

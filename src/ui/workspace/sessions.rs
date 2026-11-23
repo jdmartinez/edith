@@ -13,6 +13,7 @@ use super::{SIDEBAR_WIDTH, Workspace};
 
 use picker::SessionPicker;
 
+mod closed;
 mod picker;
 
 #[derive(Clone, Copy)]
@@ -32,6 +33,7 @@ pub(super) struct Sessions {
     session_picker: Option<SessionPicker>,
     worktree_removal: Option<WorktreeRemoval>,
     branch_input: FocusHandle,
+    expanded_closed_projects: BTreeSet<PathBuf>,
 }
 
 impl Sessions {
@@ -46,6 +48,7 @@ impl Sessions {
             session_picker: None,
             worktree_removal: None,
             branch_input,
+            expanded_closed_projects: BTreeSet::new(),
         }
     }
 
@@ -178,11 +181,11 @@ impl Workspace {
                         self.terminal_projects
                             .iter()
                             .enumerate()
-                            .filter(|(_, owner)| *owner == project)
+                            .filter(|(index, owner)| {
+                                *owner == project && !self.panes[*index].exited
+                            })
                             .map(|(index, _)| {
-                                let state = if self.panes[index].exited {
-                                    "Cerrada"
-                                } else if self.connected {
+                                let state = if self.connected {
                                     "Abierta"
                                 } else {
                                     "Sin conexión"
@@ -211,7 +214,8 @@ impl Workspace {
                                 })
                                 .mb_1()
                             }),
-                    );
+                    )
+                    .child(self.closed_sessions(project, cx));
                 self.session_picker_controls(row, project, cx)
             }))
             .child(
