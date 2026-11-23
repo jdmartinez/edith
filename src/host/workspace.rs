@@ -357,12 +357,13 @@ pub(super) fn dispatch(
             };
             let identifier = conversation.map(|id| id.to_string());
             let args = identifier.as_deref().map(|id| ["--session-id", id]);
-            let mut terminal = Terminal::launch(
+            let terminal = Terminal::launch_agent(
                 program.as_os_str(),
-                true,
+                agent,
                 &directory,
                 args.as_ref().map_or(&[], |args| args.as_slice()),
                 1,
+                conversation,
             )
             .with_context(|| {
                 format!(
@@ -371,7 +372,6 @@ pub(super) fn dispatch(
                     program.display()
                 )
             })?;
-            terminal.set_agent(agent);
             if let Some(conversation) = conversation {
                 state.conversations.insert(pane, conversation);
             }
@@ -456,21 +456,21 @@ fn reattach(
     id: uuid::Uuid,
     revision: u64,
 ) -> Result<Terminal> {
-    let id = id.to_string();
+    let identifier = id.to_string();
     let args = match agent {
-        Agent::Codex => ["resume", id.as_str()],
-        Agent::Claude | Agent::Copilot => ["--resume", id.as_str()],
+        Agent::Codex => ["resume", identifier.as_str()],
+        Agent::Claude | Agent::Copilot => ["--resume", identifier.as_str()],
     };
     let program = agent_program(state, agent)?;
-    let mut next = Terminal::launch(
+    let mut next = Terminal::launch_agent(
         program.as_os_str(),
-        true,
+        agent,
         &previous.directory,
         &args,
         revision,
+        Some(id),
     )
     .with_context(|| format!("No se pudo reanudar {}", agent.name()))?;
-    next.set_agent(agent);
     let mut backup = previous.clone();
     backup.exited = true;
     backup.pid = None;

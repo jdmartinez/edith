@@ -9,6 +9,7 @@ use crate::panels::{DesktopLayout, Panel};
 use crate::usage_panel::UsagePanel;
 
 use super::client::INTERVAL;
+use super::notifications::{Notifications, deliver_attention};
 use desktop::PanelDrag;
 use prototype::Divider;
 use sessions::Sessions;
@@ -32,6 +33,7 @@ pub(super) struct Workspace {
     desktop: bool,
     sidebar_visible: bool,
     usage: UsagePanel,
+    notifications: Notifications,
     sessions: Sessions,
     terminal_projects: Vec<PathBuf>,
     retention_days: Option<u32>,
@@ -85,6 +87,7 @@ impl Workspace {
             desktop,
             sidebar_visible: true,
             usage: UsagePanel::default(),
+            notifications: Notifications::default(),
             sessions: Sessions::new(cx.focus_handle()),
             terminal_projects: Vec::new(),
             retention_days: Some(30),
@@ -150,9 +153,18 @@ impl Workspace {
                     if !self.connected {
                         self.status = "Host conectado".into();
                     }
+                    let initial_connection = !self.connected;
                     self.connected = true;
                     for (index, pane) in panes.into_iter().enumerate() {
                         if let Some(snapshot) = pane {
+                            if self.notifications.observe(
+                                index,
+                                snapshot.pid,
+                                snapshot.attention,
+                                initial_connection,
+                            ) {
+                                deliver_attention();
+                            }
                             self.panes[index] = snapshot;
                         }
                     }
