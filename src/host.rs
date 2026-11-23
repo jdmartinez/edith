@@ -32,10 +32,39 @@ impl Default for Layout {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum Agent {
+    Claude,
+    Codex,
+    Copilot,
+}
+
+impl Agent {
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Copilot];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Copilot => "GitHub Copilot CLI",
+        }
+    }
+
+    fn executable(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Copilot => "copilot",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub revision: u64,
     pub label: String,
+    #[serde(default)]
+    pub agent: Option<Agent>,
     pub pid: Option<u32>,
     pub exited: bool,
     pub application_cursor: bool,
@@ -60,8 +89,8 @@ pub enum Request {
     AddProject(PathBuf),
     ScanProjects(PathBuf),
     AddDiscoveredProjects(Vec<PathBuf>),
-    SetCodex(Option<PathBuf>),
-    StartCodex(PathBuf),
+    SetAgentExecutable { agent: Agent, path: Option<PathBuf> },
+    StartSession { project: PathBuf, agent: Agent },
     Input { pane: usize, bytes: Vec<u8> },
     Resize { pane: usize, rows: u16, cols: u16 },
     SetLayout(Layout),
@@ -80,7 +109,7 @@ pub enum Reply {
         #[serde(default)]
         worktrees: BTreeMap<PathBuf, Vec<PathBuf>>,
         #[serde(default)]
-        codex: Option<PathBuf>,
+        agent_executables: BTreeMap<Agent, PathBuf>,
         #[serde(default)]
         terminal_projects: Vec<PathBuf>,
     },
@@ -231,7 +260,7 @@ impl Endpoint {
             .try_overwrite(true)
             .create_sync()?;
         let programs = if agents {
-            ["claude".into(), "codex".into(), "copilot".into()]
+            Agent::ALL.map(|agent| agent.executable().into())
         } else {
             [shell_program(), shell_program(), shell_program()]
         };
@@ -299,7 +328,7 @@ fn read_message<T: serde::de::DeserializeOwned>(reader: impl BufRead, limit: u64
 #[derive(Default)]
 struct WorkspaceState {
     projects: Vec<Repository>,
-    codex: Option<PathBuf>,
+    agent_executables: BTreeMap<Agent, PathBuf>,
     terminal_projects: Vec<PathBuf>,
 }
 
@@ -436,7 +465,9 @@ fn dispatch(
                         .map(|project| (project.root.clone(), project.worktrees.clone()))
                         .collect()
                 }),
-                codex: workspace.as_ref().and_then(|state| state.codex.clone()),
+                agent_executables: workspace
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |state| state.agent_executables.clone()),
                 terminal_projects: workspace
                     .as_ref()
                     .map_or_else(Vec::new, |state| state.terminal_projects.clone()),
@@ -481,38 +512,52 @@ fn dispatch(
                 state.add(project);
             }
         }
-        Request::SetCodex(path) => {
+        Request::SetAgentExecutable { agent, path } => {
             let state = workspace
                 .as_mut()
                 .context("workspace action requires the desktop host")?;
-            if let Some(path) = &path {
+            if let Some(path) = path {
                 ensure!(
-                    path.is_absolute() && is_executable(path),
-                    "Selecciona un ejecutable de Codex"
+                    path.is_absolute() && is_executable(&path),
+                    "Selecciona un ejecutable de {}",
+                    agent.name()
                 );
+                state.agent_executables.insert(agent, path);
+            } else {
+                state.agent_executables.remove(&agent);
             }
-            state.codex = path;
         }
-        Request::StartCodex(project) => {
+        Request::StartSession { project, agent } => {
             let state = workspace
                 .as_mut()
                 .context("workspace action requires the desktop host")?;
             ensure!(
                 state.projects.iter().any(|item| item.root == project),
-                "Añade el repositorio antes de iniciar Codex"
+                "Añade el repositorio antes de iniciar {}",
+                agent.name()
             );
             let detected;
-            let program = match &state.codex {
+            let program = match state.agent_executables.get(&agent) {
                 Some(custom) => custom,
                 None => {
-                    detected = detect_codex().context(
-                        "Codex no está en PATH. Elige su ejecutable desde la barra lateral.",
-                    )?;
+                    detected = detect_agent(agent).with_context(|| {
+                        format!(
+                            "No se encontró {}. Elige su ejecutable desde la barra lateral.",
+                            agent.name()
+                        )
+                    })?;
                     &detected
                 }
             };
-            let terminal = Terminal::new(program.as_os_str(), true, &project)
-                .with_context(|| format!("No se pudo iniciar Codex desde {}", program.display()))?;
+            let mut terminal =
+                Terminal::new(program.as_os_str(), true, &project).with_context(|| {
+                    format!(
+                        "No se pudo iniciar {} desde {}",
+                        agent.name(),
+                        program.display()
+                    )
+                })?;
+            terminal.agent = Some(agent);
             terminals.push(Ok(terminal));
             state.terminal_projects.push(project);
         }
@@ -521,16 +566,29 @@ fn dispatch(
     Ok(Reply::Ok)
 }
 
-fn detect_codex() -> Option<PathBuf> {
+fn detect_agent(agent: Agent) -> Option<PathBuf> {
     let path = env::var_os("PATH").unwrap_or_default();
-    #[cfg(windows)]
-    let names = ["codex.exe", "codex.cmd", "codex.bat"];
-    #[cfg(unix)]
-    let names = ["codex"];
+    let directories = env::split_paths(&path);
 
-    env::split_paths(&path)
+    #[cfg(unix)]
+    let directories = directories
+        .chain(dirs::home_dir().map(|home| home.join(".local/bin")))
+        .chain([
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+        ]);
+    #[cfg(windows)]
+    let directories =
+        directories.chain(dirs::data_local_dir().map(|local| local.join("Microsoft/WinGet/Links")));
+
+    #[cfg(windows)]
+    let names = ["exe", "cmd", "bat"].map(|ext| format!("{}.{ext}", agent.executable()));
+    #[cfg(unix)]
+    let names = [agent.executable()];
+
+    directories
         .filter(|directory| directory.is_absolute())
-        .flat_map(|directory| names.map(|name| directory.join(name)))
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
         .find(|candidate| is_executable(candidate))
 }
 
@@ -581,6 +639,7 @@ struct Terminal {
     child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
     label: String,
+    agent: Option<Agent>,
     screen: Arc<Mutex<Screen>>,
     exited: bool,
 }
@@ -650,6 +709,7 @@ impl Terminal {
             child,
             pid,
             label,
+            agent: None,
             screen,
             exited: false,
         })
@@ -731,6 +791,7 @@ impl Terminal {
         Ok(Some(Snapshot {
             revision: state.revision,
             label: self.label.clone(),
+            agent: self.agent,
             pid: self.pid,
             exited: self.exited,
             application_cursor: screen.application_cursor(),

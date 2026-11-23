@@ -33,12 +33,27 @@ impl Host {
     }
 }
 
+#[test]
+fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnection() {
+    exercise_agent("Codex", "codex");
+}
+
+#[test]
+fn claude_uses_its_own_executable_and_keeps_its_identity() {
+    exercise_agent("Claude", "claude");
+}
+
+#[test]
+fn copilot_uses_its_own_executable_and_keeps_its_identity() {
+    exercise_agent("Copilot", "copilot");
+}
+
 fn start_host() -> Host {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let state = PathBuf::from(format!("/tmp/edith-test-{nonce:x}"));
+    let state = PathBuf::from(format!("/tmp/edith-test-{}-{nonce:x}", std::process::id()));
     fs::create_dir(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_edith-gpui-prototype"))
@@ -62,8 +77,7 @@ fn start_host() -> Host {
     host
 }
 
-#[test]
-fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnection() {
+fn exercise_agent(agent: &str, executable: &str) {
     let mut host = start_host();
     let repo = host.state.join("project");
     fs::create_dir_all(repo.join("subfolder")).unwrap();
@@ -75,10 +89,10 @@ fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnectio
             .unwrap()
             .success()
     );
-    let detected = host.state.join("codex");
+    let detected = host.state.join(executable);
     fs::write(&detected, "#!/bin/sh\necho DETECTED\n").unwrap();
     fs::set_permissions(&detected, fs::Permissions::from_mode(0o700)).unwrap();
-    let custom = host.state.join("custom codex");
+    let custom = host.state.join("custom agent");
     fs::write(&custom, "#!/bin/sh\nprintf 'CUSTOM %s %s\\n' \"${PWD##*/}\" \"$CODEX_HOME\"\nread line\nprintf 'FINAL=%s\\n' \"$line\"\n").unwrap();
     fs::set_permissions(&custom, fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -87,10 +101,17 @@ fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnectio
         "Ok"
     );
     let canonical = repo.canonicalize().unwrap();
-    assert_eq!(host.request(json!({"SetCodex": custom})), "Ok");
-    assert_eq!(host.request(json!({"StartCodex": canonical})), "Ok");
+    assert_eq!(
+        host.request(json!({"SetAgentExecutable": {"agent": agent, "path": custom}})),
+        "Ok"
+    );
+    assert_eq!(
+        host.request(json!({"StartSession": {"agent": agent, "project": canonical}})),
+        "Ok"
+    );
 
     let first = host.request(json!({"Poll": []}));
+    assert_eq!(first["State"]["agent_executables"], json!({agent: custom}),);
     let pid = first["State"]["panes"][0]["pid"].as_u64().unwrap();
     let marker = |pane: &Value| pane["lines"].to_string();
     assert_eq!(
@@ -102,6 +123,7 @@ fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnectio
         let response = host.request(json!({"Poll": []}));
         let pane = &response["State"]["panes"][0];
         assert_eq!(pane["pid"], pid);
+        assert_eq!(pane["agent"], agent);
         let output = marker(pane);
         if pane["exited"] == true && output.contains("FINAL=hello") {
             assert!(
@@ -114,13 +136,20 @@ fn codex_uses_the_repository_root_and_custom_executable_and_survives_reconnectio
         assert!(Instant::now() < deadline, "{response}");
         thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(host.request(json!({"SetCodex": null})), "Ok");
-    assert_eq!(host.request(json!({"StartCodex": canonical})), "Ok");
+    assert_eq!(
+        host.request(json!({"SetAgentExecutable": {"agent": agent, "path": null}})),
+        "Ok"
+    );
+    assert_eq!(
+        host.request(json!({"StartSession": {"agent": agent, "project": canonical}})),
+        "Ok"
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let response = host.request(json!({"Poll": []}));
         let pane = &response["State"]["panes"][1];
         if pane["exited"] == true && marker(pane).contains("DETECTED") {
+            assert_eq!(pane["agent"], agent);
             assert_ne!(pane["pid"], pid);
             break;
         }
@@ -210,7 +239,10 @@ fn scanning_only_adds_selected_clones_and_preserves_running_sessions() {
     let codex = host.state.join("codex");
     fs::write(&codex, "#!/bin/sh\nread line\n").unwrap();
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(host.request(json!({"StartCodex":second})), "Ok");
+    assert_eq!(
+        host.request(json!({"StartSession":{"project":second,"agent":"Codex"}})),
+        "Ok"
+    );
     let before = host.request(json!({"Poll": []}));
     assert_eq!(before["State"]["projects"], json!([second]));
     assert_eq!(
