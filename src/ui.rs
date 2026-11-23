@@ -12,6 +12,7 @@ use workspace::Workspace;
 
 mod client;
 mod controls;
+mod notifications;
 mod workspace;
 
 pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {

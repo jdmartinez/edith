@@ -53,6 +53,8 @@ impl Agent {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub(crate) attention: super::attention::AttentionStatus,
     pub revision: u64,
     pub label: String,
     #[serde(default)]

@@ -3,7 +3,7 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
-use crate::host::{Agent, Request};
+use crate::host::{Agent, AgentState, Request};
 use crate::ui::controls::{button, icon_button};
 
 use super::Workspace;
@@ -208,6 +208,36 @@ impl Workspace {
 
     pub(super) fn session_button(&self, index: usize, label: String, cx: &Context<Self>) -> Div {
         icon_button(self.session_agent(index), label)
+            .when_some(self.panes.get(index), |button, snapshot| {
+                let (text, color) = if !self.connected {
+                    ("Sin conexión", 0x9eacc1)
+                } else {
+                    let state = if snapshot.exited {
+                        AgentState::Closed
+                    } else {
+                        snapshot.attention.state
+                    };
+                    match state {
+                        AgentState::Working => ("Trabajando", 0x8ab4ed),
+                        AgentState::Attention => ("Requiere atención", 0xf0b687),
+                        AgentState::Ready => ("Lista", 0x87e0cd),
+                        AgentState::Open => ("Abierta", 0x9eacc1),
+                        AgentState::Closed => ("Cerrada", 0x9eacc1),
+                    }
+                };
+                let badge = if self.connected && !snapshot.exited && snapshot.attention.estimated {
+                    format!("{text} (estimado)")
+                } else {
+                    text.to_owned()
+                };
+                button.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(rgb(color))
+                        .child(badge),
+                )
+            })
             .when(index == self.active, |button| {
                 button.bg(rgb(0x2b405a)).text_color(rgb(0xf1f5ff))
             })

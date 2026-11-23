@@ -5,7 +5,7 @@ use std::{
     io::{BufReader, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -780,7 +780,8 @@ fn restarting_the_host_restores_hidden_sessions_and_keeps_failed_retries_separat
 case "$1" in
 --session-id) printf '%s\n' "$2" > conversation; echo ORIGINAL; read line;;
 --resume)
-    test "$#" = 2 && test "$2" = "$(cat conversation)" || exit 7
+    test "$#" = 4 && test "$3" = "--settings" && test -f "$4" || exit 7
+    test "$2" = "$(cat conversation)" || exit 7
     test -f resume-enabled || exit 8
     echo REATTACHED
     read line
@@ -935,4 +936,76 @@ fn closed_session_cleanup_preserves_live_panes_and_honors_persisted_policy() {
     assert_ne!(state["State"]["terminal_projects"][1], "");
     assert_eq!(state["State"]["panes"][0]["lines"], json!([]));
     assert_eq!(fs::read_to_string(marker).unwrap(), "keep");
+}
+
+#[test]
+fn claude_structured_attention_is_confirmed_for_the_matching_session() {
+    let (host, repo) = panel_host();
+    let executable = host.state.join("claude-fixture");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+test "$1" = --session-id && test "$3" = --settings || exit 2
+printf '%s\n' "$4" > settings-path
+echo 'Do you want to proceed?'
+read line
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        host.request(json!({"SetAgentExecutable": {"agent": "Claude", "path": executable}})),
+        "Ok"
+    );
+    assert_eq!(
+        host.request(json!({"StartSession": {"agent": "Claude", "project": repo}})),
+        "Ok"
+    );
+    let wait_for = |predicate: &dyn Fn(&Value) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pane = host.request(json!({"Poll": []}))["State"]["panes"][0].clone();
+            if predicate(&pane["attention"]) {
+                break pane;
+            }
+            assert!(Instant::now() < deadline, "Unexpected snapshot: {pane}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let estimated = wait_for(&|status| status["estimated"] == true);
+    assert_eq!(estimated["attention"]["state"], "Attention");
+    assert!(estimated["attention"]["confirmed_request"].is_null());
+    let settings = fs::read_to_string(repo.join("settings-path")).unwrap();
+    let settings: Value = serde_json::from_slice(&fs::read(settings.trim()).unwrap()).unwrap();
+    let hook = &settings["hooks"]["Notification"][0]["hooks"][0];
+    let args = hook["args"].as_array().unwrap();
+    let emit = |session: &str| {
+        let mut child = Command::new(hook["command"].as_str().unwrap())
+            .args(args.iter().map(|arg| arg.as_str().unwrap()))
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        serde_json::to_writer(
+            child.stdin.take().unwrap(),
+            &json!({
+                "session_id": session,
+                "hook_event_name": "Notification",
+                "notification_type": "permission_prompt",
+            }),
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+    emit("fc504028-423c-44f3-8dd7-eebe7491461b");
+    let unchanged = host.request(json!({"Poll": []}));
+    assert!(unchanged["State"]["panes"][0]["attention"]["confirmed_request"].is_null());
+    emit(args[2].as_str().unwrap());
+    let confirmed = wait_for(&|status| status["confirmed_request"] == 1);
+    assert!(confirmed["revision"].as_u64() > estimated["revision"].as_u64());
+    assert_eq!(confirmed["attention"]["state"], "Attention");
+    assert_eq!(confirmed["attention"]["estimated"], false);
+    emit(args[2].as_str().unwrap());
+    let unchanged = host.request(json!({"Poll": [confirmed["revision"]]}));
+    assert!(unchanged["State"]["panes"][0].is_null());
+    host.request(json!("Stop"));
 }

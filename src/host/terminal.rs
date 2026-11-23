@@ -84,6 +84,8 @@ struct Screen {
     revision: u64,
 }
 
+use super::attention::{self, AttentionStatus, ClaudeHook};
+
 pub(super) struct Terminal {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -95,14 +97,12 @@ pub(super) struct Terminal {
     screen: Arc<Mutex<Screen>>,
     exited: bool,
     resume_backup: Option<Snapshot>,
+    claude_hook: Option<ClaudeHook>,
+    attention: AttentionStatus,
     resume_error: Option<String>,
 }
 
 impl Terminal {
-    pub(super) fn set_agent(&mut self, agent: Agent) {
-        self.agent = Some(agent);
-    }
-
     pub(super) fn link_codex_conversation(&mut self) -> Result<()> {
         ensure!(
             self.agent == Some(Agent::Codex),
@@ -118,15 +118,34 @@ impl Terminal {
     }
 
     pub(super) fn new(program: &std::ffi::OsStr, agent: bool, cwd: &Path) -> Result<Self> {
-        Self::launch(program, agent, cwd, &[], 1)
+        Self::launch(program, agent, cwd, &[], 1, None)
     }
 
-    pub(super) fn launch(
+    pub(super) fn launch_agent(
+        program: &OsStr,
+        agent: Agent,
+        cwd: &Path,
+        args: &[&str],
+        revision: u64,
+        session: Option<uuid::Uuid>,
+    ) -> Result<Self> {
+        let hook = if agent == Agent::Claude && (!cfg!(windows) || is_exe(program)) {
+            session.and_then(|session| ClaudeHook::create(session).ok())
+        } else {
+            None
+        };
+        let mut terminal = Self::launch(program, true, cwd, args, revision, hook)?;
+        terminal.agent = Some(agent);
+        Ok(terminal)
+    }
+
+    fn launch(
         program: &OsStr,
         agent: bool,
         cwd: &Path,
         args: &[&str],
         revision: u64,
+        claude_hook: Option<ClaudeHook>,
     ) -> Result<Self> {
         let rows = 24;
         let cols = 80;
@@ -136,10 +155,7 @@ impl Terminal {
             .unwrap_or(program)
             .to_string_lossy()
             .into_owned();
-        let direct_exe = Path::new(program)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
-        let mut command = if cfg!(windows) && agent && !direct_exe {
+        let mut command = if cfg!(windows) && agent && !is_exe(program) {
             // Native npm installations can expose an agent as a .cmd shim.
             // Never interpret a user-selected path as shell syntax.
             ensure!(
@@ -160,6 +176,10 @@ impl Terminal {
             CommandBuilder::new(program)
         };
         command.args(args);
+        if let Some(hook) = &claude_hook {
+            command.arg("--settings");
+            command.arg(hook.settings());
+        }
         command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         let child = pair
@@ -197,6 +217,8 @@ impl Terminal {
             screen,
             exited: false,
             resume_backup: None,
+            claude_hook,
+            attention: AttentionStatus::default(),
             resume_error: None,
         })
     }
@@ -258,6 +280,25 @@ impl Terminal {
                     Some(format!("El agente terminó al reanudar la sesión ({exit})."));
             }
         }
+        let confirmed = self
+            .claude_hook
+            .as_mut()
+            .and_then(|hook| hook.read_status().ok().flatten());
+        let attention = if self.exited {
+            AttentionStatus::closed()
+        } else if let Some(status) = confirmed {
+            status
+        } else if state.revision > seen {
+            self.agent.map_or_else(AttentionStatus::default, |agent| {
+                attention::estimate(agent, &state.parser.screen().contents())
+            })
+        } else {
+            self.attention
+        };
+        if attention != self.attention {
+            self.attention = attention;
+            state.revision = state.revision.saturating_add(1);
+        }
         if state.revision <= seen {
             return Ok(None);
         }
@@ -267,6 +308,7 @@ impl Terminal {
             return Ok(Some(Snapshot {
                 revision: state.revision,
                 resume_error: Some(error.clone()),
+                attention,
                 ..previous.clone()
             }));
         }
@@ -316,6 +358,7 @@ impl Terminal {
             .collect();
         Ok(Some(Snapshot {
             revision: state.revision,
+            attention,
             label: self.label.clone(),
             agent: self.agent,
             directory: self.directory.clone(),
@@ -338,6 +381,12 @@ impl Drop for Terminal {
             _ = self.child.wait();
         }
     }
+}
+
+fn is_exe(program: &OsStr) -> bool {
+    Path::new(program)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
 }
 
 fn pty_size(rows: u16, cols: u16) -> PtySize {
