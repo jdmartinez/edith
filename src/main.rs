@@ -1,4 +1,5 @@
 mod host;
+mod panels;
 #[cfg(feature = "ui")]
 mod ui;
 

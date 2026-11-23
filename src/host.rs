@@ -14,6 +14,8 @@ use interprocess::local_socket::{ListenerOptions, Name, Stream, prelude::*};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
+use crate::panels::{DesktopLayout, PanelAction};
+
 pub const PANE_COUNT: usize = 3;
 const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 
@@ -69,6 +71,8 @@ pub struct Snapshot {
     pub directory: PathBuf,
     pub pid: Option<u32>,
     pub exited: bool,
+    #[serde(default)]
+    pub closed_by_user: bool,
     pub application_cursor: bool,
     pub bracketed_paste: bool,
     pub lines: Vec<Vec<Run>>,
@@ -112,6 +116,7 @@ pub enum Request {
         cols: u16,
     },
     SetLayout(Layout),
+    Panel(PanelAction),
     Stop,
 }
 
@@ -144,6 +149,8 @@ pub struct LocalBranch {
 pub enum Reply {
     State {
         layout: Layout,
+        #[serde(default)]
+        desktop_layout: Option<DesktopLayout>,
         #[serde(default)]
         project_dir: String,
         panes: Vec<Option<Snapshot>>,
@@ -373,6 +380,7 @@ fn read_message<T: serde::de::DeserializeOwned>(reader: impl BufRead, limit: u64
 
 #[derive(Default)]
 struct WorkspaceState {
+    layout: DesktopLayout,
     projects: Vec<Repository>,
     agent_executables: BTreeMap<Agent, PathBuf>,
     terminal_projects: Vec<PathBuf>,
@@ -590,6 +598,7 @@ fn dispatch(
             }
             return Ok(Reply::State {
                 layout: *layout,
+                desktop_layout: workspace.as_ref().map(|state| state.layout.clone()),
                 project_dir: project_dir.into(),
                 panes,
                 projects: workspace.as_ref().map_or_else(Vec::new, |state| {
@@ -618,7 +627,7 @@ fn dispatch(
             .get_mut(pane)
             .context("unknown terminal")?
             .as_mut()
-            .map_err(|snapshot| anyhow::anyhow!("{} did not start", snapshot.label))?
+            .map_err(|snapshot| anyhow::anyhow!("{} has exited", snapshot.label))?
             .input(&bytes)?,
         Request::Resize { pane, rows, cols } => {
             if let Ok(terminal) = terminals.get_mut(pane).context("unknown terminal")? {
@@ -630,6 +639,29 @@ fn dispatch(
                 left: position.left.clamp(0.15, 0.85),
                 top: position.top.clamp(0.15, 0.85),
             };
+        }
+        Request::Panel(action) => {
+            let state = workspace.context("workspace action requires the desktop host")?;
+            match action {
+                PanelAction::Split { pane, axis } => state.layout.split(pane, axis)?,
+                PanelAction::Resize { path, ratio } => state.layout.resize(&path, ratio)?,
+                PanelAction::Show { pane } => {
+                    ensure!(pane < terminals.len(), "Sesión desconocida");
+                    state.layout.show(pane)?;
+                }
+                PanelAction::Hide { pane } => state.layout.hide(pane)?,
+                PanelAction::Dismiss { path } => state.layout.dismiss(&path)?,
+                PanelAction::Close { pane } => {
+                    ensure!(
+                        state.layout.root.contains(pane),
+                        "El panel ya no está visible"
+                    );
+                    if let Ok(terminal) = &mut terminals[pane] {
+                        terminals[pane] = Err(terminal.close()?);
+                    }
+                    state.layout.hide(pane)?;
+                }
+            }
         }
         Request::DesktopReady => ensure!(workspace.is_some(), "expected the desktop host"),
         Request::AddProject(path) => {
@@ -766,6 +798,7 @@ fn dispatch(
                     )
                 })?;
             terminal.agent = Some(agent);
+            state.layout.assign(terminals.len());
             terminals.push(Ok(terminal));
             state.terminal_projects.push(project);
         }
@@ -925,6 +958,22 @@ impl Terminal {
         })
     }
 
+    fn close(&mut self) -> Result<Snapshot> {
+        if !self.exited {
+            if self.child.try_wait()?.is_none() {
+                self.child.kill()?;
+                self.child.wait()?;
+            }
+            self.exited = true;
+        }
+        self.screen.lock().unwrap().revision += 1;
+        let mut snapshot = self
+            .snapshot(0)?
+            .context("Falta la salida de la terminal")?;
+        snapshot.closed_by_user = true;
+        Ok(snapshot)
+    }
+
     fn input(&mut self, bytes: &[u8]) -> Result<()> {
         ensure!(!self.exited, "terminal has exited");
         self.writer.write_all(bytes)?;
@@ -1005,6 +1054,7 @@ impl Terminal {
             directory: self.directory.clone(),
             pid: self.pid,
             exited: self.exited,
+            closed_by_user: false,
             application_cursor: screen.application_cursor(),
             bracketed_paste: screen.bracketed_paste(),
             lines,

@@ -18,6 +18,8 @@ use crate::host::{
     SessionTarget, Snapshot,
 };
 
+use crate::panels::{Axis, DesktopLayout, Panel, PanelAction};
+
 const HEADER_HEIGHT: f32 = 44.0;
 const STATUS_HEIGHT: f32 = 25.0;
 const SIDEBAR_WIDTH: f32 = 252.0;
@@ -104,6 +106,10 @@ pub fn run(endpoint: Endpoint, agents: bool, desktop: bool) -> Result<()> {
                         project_dir: String::new(),
                         connected: false,
                         layout: Layout::default(),
+                        desktop_layout: DesktopLayout::default(),
+                        panels_supported: false,
+                        panel_menu: None,
+                        panel_drag: None,
                         initial_layout: false,
                         drag: None,
                         sizes: Vec::new(),
@@ -132,6 +138,7 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
             match result {
                 Ok(Reply::State {
                     layout,
+                    desktop_layout,
                     project_dir,
                     panes,
                     projects,
@@ -139,7 +146,13 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                     agent_executables,
                     terminal_projects,
                 }) => {
-                    let metadata = (projects, worktrees, agent_executables, terminal_projects);
+                    let metadata = (
+                        projects,
+                        worktrees,
+                        agent_executables,
+                        terminal_projects,
+                        desktop_layout,
+                    );
                     let changed = initial
                         || disconnected
                         || workspace != metadata
@@ -157,6 +170,7 @@ fn client(endpoint: Endpoint, requests: Receiver<Request>, updates: Sender<Resul
                         && updates
                             .send(Ok(Reply::State {
                                 layout,
+                                desktop_layout: workspace.4.clone(),
                                 project_dir,
                                 panes,
                                 projects: workspace.0.clone(),
@@ -212,6 +226,43 @@ enum Divider {
     Rows,
 }
 
+struct PanelDrag {
+    path: Vec<bool>,
+    axis: Axis,
+    origin: f32,
+    initial_ratio: f32,
+    ratio: f32,
+    available: f32,
+}
+
+impl PanelDrag {
+    fn ratio_at(&self, position: gpui::Point<gpui::Pixels>) -> f32 {
+        (self.initial_ratio
+            + (axis_position(self.axis, position) - self.origin) / self.available.max(1.0))
+        .clamp(0.15, 0.85)
+    }
+}
+
+fn axis_position(axis: Axis, position: gpui::Point<gpui::Pixels>) -> f32 {
+    f32::from(match axis {
+        Axis::Columns => position.x,
+        Axis::Rows => position.y,
+    })
+}
+
+fn separator_style(axis: Axis, width: f32, height: f32) -> Div {
+    div()
+        .w(px(width))
+        .h(px(height))
+        .flex_none()
+        .bg(rgb(0x222a38))
+        .hover(|style| style.bg(rgb(0x599ce8)))
+        .cursor(match axis {
+            Axis::Columns => CursorStyle::ResizeLeftRight,
+            Axis::Rows => CursorStyle::ResizeUpDown,
+        })
+}
+
 #[derive(Clone, Copy)]
 enum PathAction {
     AddProject,
@@ -263,6 +314,10 @@ struct Workspace {
     project_dir: String,
     connected: bool,
     layout: Layout,
+    desktop_layout: DesktopLayout,
+    panels_supported: bool,
+    panel_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
+    panel_drag: Option<PanelDrag>,
     initial_layout: bool,
     drag: Option<Divider>,
     sizes: Vec<(u16, u16)>,
@@ -283,24 +338,8 @@ impl Workspace {
         let status_height = if show_status { STATUS_HEIGHT } else { 0.0 };
         let height = (f32::from(bounds.height) - HEADER_HEIGHT - status_height).max(0.0);
         let mut terminal = div().flex().flex_col().w(px(width)).min_w_0();
-        if self.panes.is_empty() {
-            terminal = terminal.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(0x929daf))
-                    .child(if self.projects.is_empty() {
-                        "Añade un repositorio para empezar."
-                    } else {
-                        "Abre una sesión desde un proyecto."
-                    }),
-            );
-        } else {
-            self.resize(self.active, width, height);
-            terminal = terminal.child(self.pane(self.active, width, height, cx));
-        }
+        let root = self.desktop_layout.root.clone();
+        terminal = terminal.child(self.desktop_panel(&root, width, height, &mut Vec::new(), cx));
 
         div()
             .size_full()
@@ -310,6 +349,9 @@ impl Workspace {
             .bg(rgb(0x11151d))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
+            .on_mouse_move(cx.listener(Self::panel_drag_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::panel_drag_end))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::panel_drag_end))
             .child(
                 div()
                     .flex()
@@ -385,6 +427,157 @@ impl Workspace {
                     })
                     .child(terminal),
             )
+            .when_some(self.panel_menu, |root, (pane, position)| {
+                root.child(
+                    div().absolute().child(gpui::deferred(
+                        gpui::anchored()
+                            .position(position + gpui::point(px(18.0), px(16.0)))
+                            .anchor(gpui::Corner::TopRight)
+                            .snap_to_window()
+                            .child(self.panel_actions(pane, cx)),
+                    )),
+                )
+            })
+    }
+
+    fn desktop_panel(
+        &mut self,
+        panel: &Panel,
+        width: f32,
+        height: f32,
+        path: &mut Vec<bool>,
+        cx: &Context<Self>,
+    ) -> Div {
+        let container = div()
+            .w(px(width))
+            .h(px(height))
+            .flex_none()
+            .overflow_hidden();
+        match panel {
+            Panel::Empty => container
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_size(px(13.0))
+                .text_color(rgb(0xaab8cc))
+                .child(if self.projects.is_empty() {
+                    "Añade un repositorio para empezar."
+                } else if self.panes.is_empty() {
+                    "Abre una sesión desde un proyecto."
+                } else {
+                    "Abre una sesión o selecciona una en la barra lateral."
+                })
+                .when(!path.is_empty(), |empty| {
+                    let path = path.clone();
+                    empty.child(button("Quitar panel").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.send(
+                                Request::Panel(PanelAction::Dismiss { path: path.clone() }),
+                                cx,
+                            );
+                        }),
+                    ))
+                }),
+            Panel::Pane(index) => {
+                self.resize(*index, width, height);
+                self.pane(*index, width, height, cx)
+            }
+            Panel::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let ratio = self
+                    .panel_drag
+                    .as_ref()
+                    .filter(|drag| drag.path == *path)
+                    .map_or(*ratio, |drag| drag.ratio);
+                let columns = *axis == Axis::Columns;
+                let extent = if columns { width } else { height };
+                let divider = DIVIDER.min(extent);
+                let available = extent - divider;
+                let first_extent = available * ratio;
+                let second_extent = available - first_extent;
+                let dimensions = |extent| {
+                    if columns {
+                        (extent, height)
+                    } else {
+                        (width, extent)
+                    }
+                };
+
+                let divider_path = path.clone();
+                let axis = *axis;
+                let (divider_width, divider_height) = dimensions(divider);
+                let separator = separator_style(axis, divider_width, divider_height).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                        view.panel_menu = None;
+                        view.panel_drag = Some(PanelDrag {
+                            path: divider_path.clone(),
+                            axis,
+                            origin: axis_position(axis, event.position),
+                            initial_ratio: ratio,
+                            ratio,
+                            available,
+                        });
+                        cx.notify();
+                    }),
+                );
+                path.push(false);
+                let (w, h) = dimensions(first_extent);
+                let first = self.desktop_panel(first, w, h, path, cx);
+                *path.last_mut().unwrap() = true;
+                let (w, h) = dimensions(second_extent);
+                let second = self.desktop_panel(second, w, h, path, cx);
+                path.pop();
+
+                container
+                    .flex()
+                    .when(!columns, |group| group.flex_col())
+                    .child(first)
+                    .child(separator)
+                    .child(second)
+            }
+        }
+    }
+
+    fn panel_drag_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            if self.panel_drag.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        if let Some(drag) = &mut self.panel_drag {
+            drag.ratio = drag.ratio_at(event.position);
+            cx.notify();
+        }
+    }
+
+    fn panel_drag_end(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(drag) = self.panel_drag.take() {
+            let ratio = drag.ratio_at(event.position);
+            if self.desktop_layout.resize(&drag.path, ratio).is_ok() {
+                self.send(
+                    Request::Panel(PanelAction::Resize {
+                        path: drag.path,
+                        ratio,
+                    }),
+                    cx,
+                );
+            }
+            cx.notify();
+        }
     }
 
     fn desktop_sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -470,6 +663,9 @@ impl Workspace {
                                 } else {
                                     "Sin conexión"
                                 };
+                                let hidden = self.panels_supported
+                                    && !self.desktop_layout.root.contains(index)
+                                    && !self.panes[index].closed_by_user;
                                 self.session_button(
                                     index,
                                     format!(
@@ -479,6 +675,16 @@ impl Workspace {
                                     ),
                                     cx,
                                 )
+                                .when(hidden, |row| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .ml_auto()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(0xb9cbe4))
+                                            .child("Oculta"),
+                                    )
+                                })
                                 .mb_1()
                             }),
                     )
@@ -851,6 +1057,7 @@ impl Workspace {
             match update {
                 Ok(Reply::State {
                     layout,
+                    desktop_layout,
                     project_dir,
                     panes,
                     projects,
@@ -858,8 +1065,19 @@ impl Workspace {
                     agent_executables,
                     terminal_projects,
                 }) => {
-                    if self.initial_layout && self.desktop && panes.len() > self.panes.len() {
-                        self.active = panes.len() - 1;
+                    if self.desktop {
+                        self.panels_supported = desktop_layout.is_some();
+                        if let Some(layout) = desktop_layout {
+                            self.active = layout.focused.unwrap_or_default();
+                            self.desktop_layout = layout;
+                        } else {
+                            if panes.len() > self.panes.len() {
+                                self.active = panes.len() - 1;
+                            }
+                            self.desktop_layout.root = panes
+                                .get(self.active)
+                                .map_or(Panel::Empty, |_| Panel::Pane(self.active));
+                        }
                     }
                     self.projects = projects;
                     self.worktrees = worktrees;
@@ -1028,27 +1246,31 @@ impl Workspace {
     }
 
     fn separator(&self, divider: Divider, width: f32, height: f32, cx: &Context<Self>) -> Div {
-        div()
-            .w(px(width))
-            .h(px(height))
-            .flex_none()
-            .bg(rgb(0x222a38))
-            .hover(|style| style.bg(rgb(0x599ce8)))
-            .cursor(match divider {
-                Divider::Columns => CursorStyle::ResizeLeftRight,
-                Divider::Rows => CursorStyle::ResizeUpDown,
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |view, _, _, _| {
-                    view.drag = Some(divider);
-                }),
-            )
+        let axis = match divider {
+            Divider::Columns => Axis::Columns,
+            Divider::Rows => Axis::Rows,
+        };
+        separator_style(axis, width, height).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, _, _, _| {
+                view.drag = Some(divider);
+            }),
+        )
     }
 
     fn focus_pane(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.active = index;
+        self.panel_menu = None;
+        if !self.panels_supported || self.desktop_layout.root.contains(index) {
+            self.active = index;
+        }
         self.focus.focus(window);
+        if self.panels_supported {
+            let _ = self
+                .requests
+                .send(Request::Panel(PanelAction::Show { pane: index }));
+        } else if self.desktop {
+            self.desktop_layout.root = Panel::Pane(index);
+        }
         cx.notify();
     }
 
@@ -1226,15 +1448,40 @@ impl Workspace {
                     .bg(rgb(if focused { 0x263b53 } else { 0x1c2431 }))
                     .text_size(px(12.0))
                     .child(div().min_w_0().truncate().child(if self.desktop {
-                        if snapshot.directory.as_os_str().is_empty() {
-                            self.terminal_projects[index].display().to_string()
+                        let directory = if snapshot.directory.as_os_str().is_empty() {
+                            &self.terminal_projects[index]
                         } else {
-                            snapshot.directory.display().to_string()
-                        }
+                            &snapshot.directory
+                        };
+                        format!("{label} {} · {}", index + 1, directory.display())
                     } else {
                         format!("{}  {label}", index + 1)
                     }))
-                    .child(div().flex_none().text_color(rgb(0xaab8cc)).child(status)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .when(!self.panels_supported || width >= 285.0, |header| {
+                                header.child(div().text_color(rgb(0xaab8cc)).child(status))
+                            })
+                            .when(self.panels_supported, |header| {
+                                header.child(button("Panel ▾").on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        move |view, event: &gpui::MouseDownEvent, _, cx| {
+                                            view.panel_menu =
+                                                (view.panel_menu.map(|(pane, _)| pane)
+                                                    != Some(index))
+                                                .then_some((index, event.position));
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        },
+                                    ),
+                                ))
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1269,6 +1516,48 @@ impl Workspace {
                                 span.child(SharedString::from(run.text.clone()))
                             }))
                     })),
+            )
+    }
+
+    fn panel_actions(&self, pane: usize, cx: &Context<Self>) -> Div {
+        div()
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_md()
+            .bg(rgb(0x171d28))
+            .children(
+                [
+                    (
+                        "Dividir a la derecha",
+                        PanelAction::Split {
+                            pane,
+                            axis: Axis::Columns,
+                        },
+                    ),
+                    (
+                        "Dividir debajo",
+                        PanelAction::Split {
+                            pane,
+                            axis: Axis::Rows,
+                        },
+                    ),
+                    ("Ocultar sesión", PanelAction::Hide { pane }),
+                    ("Cerrar sesión", PanelAction::Close { pane }),
+                ]
+                .into_iter()
+                .map(|(label, action)| {
+                    button(label).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, window, cx| {
+                            view.panel_menu = None;
+                            view.focus.focus(window);
+                            view.send(Request::Panel(action.clone()), cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                }),
             )
     }
 
@@ -1311,7 +1600,10 @@ impl Workspace {
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.active;
-        if !self.connected || self.panes.get(pane).is_none_or(|pane| pane.exited) {
+        if !self.connected
+            || (self.desktop && !self.desktop_layout.root.contains(pane))
+            || self.panes.get(pane).is_none_or(|pane| pane.exited)
+        {
             return;
         }
         let key = &event.keystroke;

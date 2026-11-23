@@ -406,3 +406,127 @@ fn sessions_keep_their_checkout_when_opening_or_creating_worktrees() {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
+fn panel_host() -> (Host, PathBuf) {
+    let host = start_host();
+    let repo = host.state.join("panels");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let repo = repo.canonicalize().unwrap();
+    let executable = host.state.join("codex");
+    fs::write(
+        &executable,
+        "#!/bin/sh\nwhile read line; do printf 'RECEIVED:%s\\n' \"$line\"; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(host.request(json!({"AddProject":repo})), "Ok");
+    (host, repo)
+}
+
+fn open_panel(host: &Host, repo: &std::path::Path) {
+    assert_eq!(
+        host.request(json!({"StartSession":{"project":repo,"agent":"Codex"}})),
+        "Ok"
+    );
+}
+
+fn panel_action(host: &Host, action: Value) {
+    assert_eq!(host.request(json!({"Panel":action})), "Ok");
+}
+
+#[test]
+fn nested_panel_assignments_and_ratios_survive_client_reconnection() {
+    let (host, repo) = panel_host();
+    open_panel(&host, &repo);
+    panel_action(&host, json!({"Split":{"pane":0,"axis":"Columns"}}));
+    open_panel(&host, &repo);
+    panel_action(&host, json!({"Split":{"pane":1,"axis":"Rows"}}));
+    open_panel(&host, &repo);
+    panel_action(&host, json!({"Resize":{"path":[],"ratio":0.625}}));
+    panel_action(&host, json!({"Resize":{"path":[true],"ratio":0.375}}));
+    let before = host.request(json!({"Poll":[]}));
+    let after = host.request(json!({"Poll":[]}));
+    assert_eq!(
+        after["State"]["desktop_layout"]["root"],
+        json!({
+            "Split":{"axis":"Columns","ratio":0.625,"first":{"Pane":0},"second":{
+                "Split":{"axis":"Rows","ratio":0.375,"first":{"Pane":1},"second":{"Pane":2}}
+            }}
+        })
+    );
+    for pane in 0..3 {
+        let pid = &after["State"]["panes"][pane]["pid"];
+        assert!(pid.is_number());
+        assert_eq!(*pid, before["State"]["panes"][pane]["pid"]);
+    }
+}
+
+#[test]
+fn hiding_keeps_the_process_running_and_showing_restores_the_same_terminal() {
+    let (host, repo) = panel_host();
+    open_panel(&host, &repo);
+    panel_action(&host, json!({"Split":{"pane":0,"axis":"Columns"}}));
+    open_panel(&host, &repo);
+    let before = host.request(json!({"Poll":[]}));
+    let pid = &before["State"]["panes"][1]["pid"];
+
+    panel_action(&host, json!({"Hide":{"pane":1}}));
+    let hidden = host.request(json!({"Poll":[]}));
+    assert_eq!(hidden["State"]["desktop_layout"]["root"], json!({"Pane":0}));
+    assert_eq!(hidden["State"]["panes"][1]["exited"], false);
+    assert_eq!(hidden["State"]["panes"][1]["pid"], *pid);
+    assert_eq!(
+        host.request(json!({"Input":{"pane":1,"bytes":b"hidden\r"}})),
+        "Ok"
+    );
+
+    panel_action(&host, json!({"Show":{"pane":1}}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shown = host.request(json!({"Poll":[]}));
+        assert_eq!(shown["State"]["desktop_layout"]["focused"], 1);
+        assert_eq!(
+            shown["State"]["desktop_layout"]["root"]["Split"]["first"],
+            json!({"Pane":0})
+        );
+        assert_eq!(
+            shown["State"]["desktop_layout"]["root"]["Split"]["second"],
+            json!({"Pane":1})
+        );
+        assert_eq!(shown["State"]["panes"][1]["pid"], *pid);
+        if shown["State"]["panes"][1]["lines"]
+            .to_string()
+            .contains("RECEIVED:hidden")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{shown}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn closing_a_panel_stops_its_terminal_and_keeps_the_other_panel_assigned() {
+    let (host, repo) = panel_host();
+    open_panel(&host, &repo);
+    panel_action(&host, json!({"Split":{"pane":0,"axis":"Rows"}}));
+    open_panel(&host, &repo);
+    let before = host.request(json!({"Poll":[]}));
+    let other_pid = &before["State"]["panes"][0]["pid"];
+
+    panel_action(&host, json!({"Close":{"pane":1}}));
+    let after = host.request(json!({"Poll":[]}));
+    assert_eq!(after["State"]["desktop_layout"]["root"], json!({"Pane":0}));
+    assert_eq!(after["State"]["desktop_layout"]["focused"], 0);
+    assert_eq!(after["State"]["panes"][1]["exited"], true);
+    assert_eq!(after["State"]["panes"][0]["pid"], *other_pid);
+    assert_eq!(after["State"]["panes"][0]["exited"], false);
+    assert!(host.request(json!({"Input":{"pane":1,"bytes":b"closed\r"}}))["Error"].is_string());
+}
